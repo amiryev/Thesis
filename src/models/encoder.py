@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 from torchvision.models import vgg16, VGG16_Weights
 
-from models.layers import Sobel, DirectionalMambaBlock
+from src.models.layers import Sobel, DirectionalMambaBlock
 
 class XrayEncoder(nn.Module):
     """

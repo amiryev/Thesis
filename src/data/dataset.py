@@ -14,7 +14,7 @@ from diffdrr.drr import DRR
 from diffdrr.renderers import _get_alphas, _get_alpha_minmax
 from diffdrr.pose import convert
 
-from config import default as config
+from src.config import default as config
 
 def _normalize_projection(projection: torch.Tensor) -> torch.Tensor:
     """

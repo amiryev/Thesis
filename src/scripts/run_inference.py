@@ -4,13 +4,13 @@ import torch.nn.functional as F
 import matplotlib.pyplot as plt
 from collections import OrderedDict
 
-from config import default as config
-from models.encoder import XrayEncoder
-from models.estimator import PositionEstimator
-from core.registration import PoseOptimizer
-from data.dataset import PoseDataset
-from utils import image_processing
-from utils.loss import PositionLoss
+from src.config import default as config
+from src.models.encoder import XrayEncoder
+from src.models.estimator import PositionEstimator
+from src.core.registration import PoseOptimizer
+from src.data.dataset import PoseDataset
+from src.utils import image_processing
+from src.utils.loss import PositionLoss
 
 def run_inference(
     patient_index: int = 3, 

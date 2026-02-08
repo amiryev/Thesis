@@ -8,7 +8,7 @@ from diffdrr.drr import DRR
 from diffdrr.data import read
 from diffdrr.pose import convert
 
-from config import default as config
+from src.config import default as config
 
 class PositionEstimator(nn.Module):
     def __init__(self, encoder, dicom_file, crm_path, sdd=config.SDD, delx=config.DELX, size=config.IMAGE_SIZE, num_candidates=None):

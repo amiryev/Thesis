@@ -2,7 +2,7 @@ from pathlib import Path
 import torch
 
 # Paths
-# Note: These paths assume you are running from the project root (parent of modular_xray)
+# Note: These paths assume you are running from the project root (parent of )
 # Adjust if necessary or make them absolute
 DATA_DIR = Path("datasets")
 CT_DIR = DATA_DIR / "CT"

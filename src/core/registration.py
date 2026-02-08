@@ -4,9 +4,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from diffdrr.metrics import MultiscaleNormalizedCrossCorrelation2d
 
-from models.layers import Sobel
-from utils import image_processing
-from utils import loss as loss_utils
+from src.models.layers import Sobel
+from src.utils import image_processing
+from src.utils import loss as loss_utils
 
 class PoseOptimizer(nn.Module):
     def __init__(self, position_estimator):
