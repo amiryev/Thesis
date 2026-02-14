@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from diffdrr.metrics import MultiscaleNormalizedCrossCorrelation2d
 
-from src.models.layers import Sobel
+from src.core.layers import Sobel
 from src.utils import image_processing
 from src.utils import loss as loss_utils
 

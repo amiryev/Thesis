@@ -4,9 +4,9 @@ import torch.nn.functional as F
 import matplotlib.pyplot as plt
 from collections import OrderedDict
 
-from src.config import default as config
-from src.models.encoder import XrayEncoder
-from src.models.estimator import PositionEstimator
+from src.utils import config as config
+from src.core.encoder import XrayEncoder
+from src.core.estimator import PositionEstimator
 from src.core.registration import PoseOptimizer
 from src.data.dataset import PoseDataset
 from src.utils import image_processing
