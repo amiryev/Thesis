@@ -1,3 +1,5 @@
+import os
+import json
 import math
 import itertools
 from pathlib import Path
@@ -128,7 +130,7 @@ class MultiPatientDRRDataset(Dataset):
     """
     def __init__(
         self,
-        ct_dir: Path,
+        data_dir: Path,
         device: torch.device = torch.device("cpu"),
         size: int = config.IMAGE_SIZE,
         sdd: float = config.SDD,
@@ -137,9 +139,10 @@ class MultiPatientDRRDataset(Dataset):
         min_intersections: int = 750,
         samples_per_epoch: int = 10000,
         seed: int = 42,
+        patient_ids: tuple = (1, 11)
     ):
         super().__init__()
-        self.ct_dir = Path(ct_dir)
+        self.data_dir = Path(data_dir)
         self.device = device
         self.size = size
         self.sdd = sdd
@@ -149,7 +152,8 @@ class MultiPatientDRRDataset(Dataset):
         self.samples_per_epoch = samples_per_epoch
         self.rng = np.random.default_rng(seed)
 
-        ct_files_all = sorted(list(self.ct_dir.glob("*.nii*")))
+        index_json = os.path.join(self.data_dir, "data_index.json")
+        ct_files_all = self.load_ct_subset(index_json, patient_ids[0], patient_ids[1])
         self.entries: List[Tuple[Subject, DRR, Dict[str, torch.Tensor], List[Tuple[int, ...]]]] = []
 
         for ct_path in ct_files_all:
@@ -171,6 +175,39 @@ class MultiPatientDRRDataset(Dataset):
 
     def __len__(self):
         return self.samples_per_epoch
+
+    def load_ct_subset(self, index_file, patient_start, patient_end):
+        """
+        Load CT file paths for a subset of patients.
+
+        Parameters
+        ----------
+        index_file : str 
+            Path to dataset index JSON.
+        patient_start : int
+            First patient ID (inclusive).
+        patient_end : int
+            Last patient ID (inclusive).
+
+        Returns
+        -------
+        list
+            List of CT file paths.
+        """
+
+        with open(index_file, "r") as f:
+            index = json.load(f)
+
+        ct_list = []
+
+        for entry in index["entries"]:
+            pid = int(entry["id"])
+
+            if patient_start <= pid <= patient_end:
+                curr_ct_path = os.path.join(self.data_dir, entry["ct"])
+                ct_list.append(curr_ct_path)
+
+        return sorted(ct_list)
 
     @staticmethod
     def _build_grids(steps: int) -> Dict[str, torch.Tensor]:
@@ -250,14 +287,8 @@ class MultiPatientDRRDataset(Dataset):
         yaw_grid, pitch_grid, roll_grid = grids["yaw"], grids["pitch"], grids["roll"]
         dxg, dyg, dzg = grids["dx"], grids["dy"], grids["dz"]
         
-        rotation = torch.tensor(
-            [yaw_grid[index_tuple[0]], pitch_grid[index_tuple[1]], roll_grid[index_tuple[2]]],
-            device=device,
-        ).unsqueeze(0)  # (1,3)
-        translation = torch.tensor(
-            [dxg[index_tuple[3]], dyg[index_tuple[4]], dzg[index_tuple[5]]],
-            device=device,
-        ).unsqueeze(0)  # (1,3)
+        rotation = torch.tensor([yaw_grid[index_tuple[0]], pitch_grid[index_tuple[1]], roll_grid[index_tuple[2]]], device=device,).unsqueeze(0)  # (1,3)
+        translation = torch.tensor([dxg[index_tuple[3]], dyg[index_tuple[4]], dzg[index_tuple[5]]], device=device).unsqueeze(0)  # (1,3)
         return rotation, translation
 
     def __getitem__(self, idx: int) -> torch.Tensor:

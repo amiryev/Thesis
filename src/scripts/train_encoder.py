@@ -10,8 +10,8 @@ from tqdm import tqdm
 import time
 import datetime
 
-from src.config import default as config
-from src.models.encoder import XrayEncoder
+from src.utils import config
+from src.core.encoder import XrayEncoder
 from src.data.dataset import MultiPatientDRRDataset
 from src.utils.training import DDPHelper, CheckpointManager, AverageMeter, setup_logger, set_visible_devices
 
@@ -31,8 +31,8 @@ def parse_args():
     parser.add_argument("--patch-size", type=int, default=config.PATCH_SIZE, help="Size of patches")
     
     # Paths
-    parser.add_argument("--output-dir", type=Path, default=Path("experiments/encoder"), help="Directory to save checkpoints/logs")
-    parser.add_argument("--data-dir", type=Path, default=config.DATA_DIR, help="Root directory containing CT/ and CRM/")
+    parser.add_argument("--ckpt_dir", type=Path, default=Path(config.CKPT_DIR), help="Directory to save checkpoints/logs")
+    parser.add_argument("--data_dir", type=Path, default=Path(config.DATA_DIR), help="Root directory containing CT/ and CRM/")
     parser.add_argument("--resume", type=Path, help="Path to checkpoint to resume from")
     parser.add_argument("--gpus", type=str, default=None, help="Comma-separated list of GPU IDs to use (e.g., '0,1')")
 
@@ -82,6 +82,8 @@ def train_one_epoch(model, loader, optimizer, device, epoch, args, rank, logger)
         
         if rank == 0:
             pbar.set_postfix(loss=f"{meters.avg:.5f}")
+
+        break
             
     return meters.avg
 
@@ -95,23 +97,24 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace):
     # Logging setup (Rank 0 only)
     logger = None
     if rank == 0:
-        args.output_dir.mkdir(parents=True, exist_ok=True)
+        args.ckpt_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        logger = setup_logger("train_encoder", args.output_dir / f"train_{timestamp}.log")
+        logger = setup_logger("train_encoder", args.ckpt_dir / f"train_{timestamp}.log")
         logger.info(f"Starting Encoder Training on {world_size} GPUs")
         logger.info(f"Arguments: {vars(args)}")
 
     # --- 2. Data Loading ---
-    ct_dir = args.data_dir / "CT"
-    if not ct_dir.exists():
-        if rank == 0: logger.error(f"CT directory not found at {ct_dir}")
+    data_dir = args.data_dir
+    if not data_dir.exists():
+        if rank == 0: logger.error(f"CT directory not found at {data_dir}")
         DDPHelper.cleanup()
         return
 
     dataset = MultiPatientDRRDataset(
-        ct_dir=ct_dir,
-        device=device,
+        data_dir=data_dir,
+        device='cpu',
         size=config.IMAGE_SIZE,
+        patient_ids=(7,11)
         # Potentially additional params if dataset supports them
     )
     
@@ -145,7 +148,7 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace):
     # --- 4. Resume Checkpoint ---
     start_epoch = 0
     best_loss = float('inf')
-    ckpt_manager = CheckpointManager(args.output_dir, rank)
+    ckpt_manager = CheckpointManager(args.ckpt_dir, rank)
     
     if args.resume:
         ckpt = ckpt_manager.load(args.resume, device)
@@ -207,6 +210,7 @@ def main():
     # Auto-detect distributed availability
     if torch.cuda.is_available():
         world_size = torch.cuda.device_count()
+        torch.autograd.set_detect_anomaly(True)
         print(f"Launching DDP training on {world_size} GPUs.")
         DDPHelper.spawn(train_worker, world_size, args=(args,))
     else:

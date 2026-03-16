@@ -45,7 +45,6 @@ class XrayEncoder(nn.Module):
             C, H, W = feat.shape[1:]  # skip batch dim
 
         # Mamba over flattened spatial tokens with learned positional encoding
-        C, H, W = self.encoded_shape
         self.positional_encoding = nn.Parameter(torch.zeros(H * W, C))
         torch.nn.init.trunc_normal_(self.positional_encoding, std=0.02)
 
@@ -69,17 +68,17 @@ class XrayEncoder(nn.Module):
 
         # Lightweight decoder to 1xHxW
         self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(512, 256, kernel_size=4, stride=2, padding=1),  # 4->8
+            nn.ConvTranspose2d(C, C//2, kernel_size=4, stride=2, padding=1),  # 4->8
             nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1),  # 8->16
+            nn.ConvTranspose2d(C//2, C//4, kernel_size=4, stride=2, padding=1),  # 8->16
             nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(128, 64,  kernel_size=4, stride=2, padding=1),  # 16->32
+            nn.ConvTranspose2d(C//4, C//8,  kernel_size=4, stride=2, padding=1),  # 16->32
             nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(64,  32,  kernel_size=4, stride=2, padding=1),  # 32->64
+            nn.ConvTranspose2d(C//8,  C//16,  kernel_size=4, stride=2, padding=1),  # 32->64
             nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(32,  16,  kernel_size=4, stride=2, padding=1),  # 64->128
+            nn.ConvTranspose2d(C//16,  C//32,  kernel_size=4, stride=2, padding=1),  # 64->128
             nn.ReLU(inplace=True),
-            nn.Conv2d(16, 1, kernel_size=3, padding=1),
+            nn.Conv2d(C//32, 1, kernel_size=3, padding=1),
             nn.Sigmoid(),  # target images normalized to [0,1]
         )
 
@@ -133,6 +132,7 @@ class XrayEncoder(nn.Module):
 
         if patch_mask is not None:
             mask = patch_mask.bool()
+            tokens = tokens.clone()
             tokens[mask] = self.mask_token
             # mask = patch_mask.unsqueeze(-1).float()   # (B, L, 1)
             # tokens = tokens * (1 - mask) + self.mask_token * mask
