@@ -1,14 +1,14 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "1,2,3,4"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,3,4"
 import argparse
-import sys
-import torch
 from pathlib import Path
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader, DistributedSampler
-from tqdm import tqdm
 import time
 import datetime
+from tqdm import tqdm
+
+import torch
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, DistributedSampler
 
 from src.utils import config
 from src.core.encoder import XrayEncoder
@@ -20,11 +20,11 @@ def parse_args():
     
     # Training Hyperparams
     parser.add_argument("--epochs", type=int, default=50, help="Number of epochs to train")
-    parser.add_argument("--batch-size", type=int, default=16, help="Batch size per GPU")
+    parser.add_argument("--batch_size", type=int, default=16, help="Batch size per GPU")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
     parser.add_argument("--weight-decay", type=float, default=1e-2, help="Weight decay for optimizer")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--num-workers", type=int, default=4, help="Number of dataloader workers")
+    parser.add_argument("--num_workers", type=int, default=0, help="Number of dataloader workers")
     
     # Encoder Specific
     parser.add_argument("--mask-ratio", type=float, default=0.6, help="Ratio of patches to mask")
@@ -82,8 +82,6 @@ def train_one_epoch(model, loader, optimizer, device, epoch, args, rank, logger)
         
         if rank == 0:
             pbar.set_postfix(loss=f"{meters.avg:.5f}")
-
-        break
             
     return meters.avg
 
@@ -120,12 +118,14 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace):
     
     # Distributed Sampler ensures each GPU sees a different subset
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
+    pw = (args.num_workers > 0)
     loader = DataLoader(
         dataset, 
-        batch_size=args.batch_size, 
+        batch_size=args.batch_size,     # Increased from 16 to utilize 48GB VRAM
         sampler=sampler, 
-        num_workers=0, # Use 0 for robustness with spawning, increase if safe
-        pin_memory=True
+        num_workers=args.num_workers,   # Start with 4 workers PER GPU (16 total)
+        pin_memory=True,                # Keeps data in "page-locked" memory for faster GPU transfer
+        persistent_workers=pw,         # Keeps workers alive between epochs to save time
     )
 
     # --- 3. Model Setup ---
@@ -210,7 +210,6 @@ def main():
     # Auto-detect distributed availability
     if torch.cuda.is_available():
         world_size = torch.cuda.device_count()
-        torch.autograd.set_detect_anomaly(True)
         print(f"Launching DDP training on {world_size} GPUs.")
         DDPHelper.spawn(train_worker, world_size, args=(args,))
     else:

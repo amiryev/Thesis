@@ -43,11 +43,17 @@ def set_visible_devices(gpus: str):
 
 class DDPHelper:
     @staticmethod
-    def setup(rank: int, world_size: int, master_addr='localhost', master_port='12345'):
+    def setup(rank: int, world_size: int,
+              master_addr='localhost',
+              master_port='12345',
+              backend='nccl'): 
+
         os.environ['MASTER_ADDR'] = master_addr
         os.environ['MASTER_PORT'] = master_port
-        dist.init_process_group("nccl", rank=rank, world_size=world_size)
+
         torch.cuda.set_device(rank)
+
+        dist.init_process_group(backend=backend, rank=rank, world_size=world_size, init_method='env://')
 
     @staticmethod
     def cleanup():
