@@ -7,7 +7,7 @@ from typing import List, Tuple, Dict
 
 import numpy as np
 import torch
-import torch.nn.functional as F
+import torchvision.io as io
 from torch.utils.data import Dataset
 from torchio import Subject
 
@@ -304,3 +304,56 @@ class MultiPatientDRRDataset(Dataset):
         proj = _normalize_projection(proj)
 
         return proj  
+
+class DRRMetadataDataset(Dataset):
+    def __init__(self, root_dir, transform=None):
+        self.root_dir = root_dir
+        self.transform = transform
+        self.samples = []
+
+        # 1. Load the master index to find patient folders
+        master_path = os.path.join(root_dir, 'master_index.json')
+        with open(master_path, 'r') as f:
+            patients = json.load(f)
+
+        # 2. Map every image to its specific metadata
+        for p in patients:
+            p_folder = p['folder']
+            p_dir = os.path.join(root_dir, p_folder)
+            
+            # Load the specific patient's metadata
+            metadata_path = os.path.join(p_dir, 'metadata.json')
+            with open(metadata_path, 'r') as f:
+                p_metadata = json.load(f)
+
+            # Link image path to its pose/labels
+            for img_name, info in p_metadata.items():
+                self.samples.append({
+                    'path': os.path.join(p_dir, img_name),
+                    'pose': torch.tensor(info['pose'], dtype=torch.float32),
+                    'is_centered': int(info['is_centered']),
+                    'orientation': info['orientation']
+                })
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        sample = self.samples[idx]
+        
+        # Load Image
+        image = io.read_image(sample['path'], mode=io.ImageReadMode.GRAY)
+    
+        # Convert to float and normalize to [0, 1]
+        image = image.float() / 255.0
+
+        if self.transform:
+            image = self.transform(image)
+
+        # Return image and the pose (common target for DRR training)
+        # return {
+        #     'image': image,
+        #     'pose': sample['pose'],
+        #     'orientation': sample['orientation']
+        # }
+        return image

@@ -1,5 +1,4 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,3,4"
 import argparse
 from pathlib import Path
 import time
@@ -12,7 +11,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 
 from src.utils import config
 from src.core.encoder import XrayEncoder
-from src.data.dataset import MultiPatientDRRDataset
+from src.data.dataset import MultiPatientDRRDataset, DRRMetadataDataset
 from src.utils.training import DDPHelper, CheckpointManager, AverageMeter, setup_logger, set_visible_devices
 
 def parse_args():
@@ -25,7 +24,8 @@ def parse_args():
     parser.add_argument("--weight-decay", type=float, default=1e-2, help="Weight decay for optimizer")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--num_workers", type=int, default=0, help="Number of dataloader workers")
-    
+    parser.add_argument("--on_the_fly", type=str, default=False, help="Generate DRR while training or use pre-generated dataset")
+
     # Encoder Specific
     parser.add_argument("--mask-ratio", type=float, default=0.6, help="Ratio of patches to mask")
     parser.add_argument("--patch-size", type=int, default=config.PATCH_SIZE, help="Size of patches")
@@ -108,14 +108,17 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace):
         DDPHelper.cleanup()
         return
 
-    dataset = MultiPatientDRRDataset(
-        data_dir=data_dir,
-        device='cpu',
-        size=config.IMAGE_SIZE,
-        patient_ids=(7,11)
-        # Potentially additional params if dataset supports them
-    )
-    
+    if args.on_the_fly is True:
+        dataset = MultiPatientDRRDataset(
+            data_dir=data_dir,
+            device='cpu',
+            size=config.IMAGE_SIZE,
+            patient_ids=(7,11)
+            # Potentially additional params if dataset supports them
+        )
+    else:
+        dataset = DRRMetadataDataset(root_dir=data_dir)
+
     # Distributed Sampler ensures each GPU sees a different subset
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
     pw = (args.num_workers > 0)
