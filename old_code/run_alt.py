@@ -1,10 +1,7 @@
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "4"
-export "CUDA_VISIBLE_DEVICES"=4
-from position_estimator import PositionEstimator
-from xray_encoder import XrayEncoder
+
 from collections import OrderedDict
-from pose_optimizer_alt import PoseOptimizer
 import torch
 from torch import nn
 import numpy as np
@@ -17,13 +14,17 @@ import torch.nn.functional as F
 import torchvision.transforms.functional as TF
 import random
 from torchvision.transforms.functional import gaussian_blur
-from dataset import PoseDataset
-from utils import apply_noise_brightness_contrast, PositionLoss
+
+from old_code.pose_optimizer_alt import PoseOptimizer
+from old_code.position_estimator import PositionEstimator
+from old_code.xray_encoder import XrayEncoder
+from old_code.dataset import PoseDataset
+from old_code.utils import apply_noise_brightness_contrast, PositionLoss
 
 index = 3
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model_dir = '/mnt/storage/users/amiry/xray2ct/models'
-data_dir = '/mnt/storage/users/amiry/xray2ct/Datasets'
+model_dir = '/mnt/storage/users/amiry//git/Thesis/models'
+data_dir = '/mnt/storage/users/amiry/git/Thesis/datasets'
 
 
 num_trials = 1
@@ -85,19 +86,20 @@ poses = PoseDataset(position_estimator.ct, steps=5, min_intersections=500, devic
 # loss = PositionLoss()
 loss = PositionLoss().to(device)
 
-for j_iter in range(1000):
+num_iterations = 10
+for j_iter in range(num_iterations):
     print(f'iter {j_iter}')
     i = torch.randint(len(poses), (1,)).item()
     rotation, translation = poses[i]
     # gt_pose = torch.cat([rotation, translation], dim=-1).to(device)
     gt_pose = torch.cat([rotation, translation], dim=-1).unsqueeze(0).to(device)
     new_crm = position_estimator.project(gt_pose)
-    new_crm = apply_noise_brightness_contrast(new_crm, noise_std=0.015, brightness=0.25, contrast=0.55) * (crm > 0.0)
+    # new_crm = apply_noise_brightness_contrast(new_crm, noise_std=0.015, brightness=0.25, contrast=0.55) * (crm > 0.0)
     # angle_deg = random.uniform(-0, 0)
     # s = random.uniform(1.0, 1.1)
     # new_crm = TF.rotate(crm, angle_deg, interpolation=TF.InterpolationMode.BILINEAR)
     pose_optimizer.update_crm(new_crm)
-    new_crm = gaussian_blur(new_crm, 5, 1.0)
+    # new_crm = gaussian_blur(new_crm, 5, 1.0)
     
     with torch.no_grad():
         projection_pred, pose_pred = position_estimator(new_crm)

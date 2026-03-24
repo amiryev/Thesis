@@ -188,16 +188,12 @@ class MultiPatientDRRDataset(Dataset):
 
     @staticmethod
     def _build_grids(steps: int) -> Dict[str, torch.Tensor]:
-        yaw_grid = torch.linspace(-math.pi / 3, math.pi / 3, steps)  # yaw, pitch, roll
-        pitch_grid = torch.linspace(-math.pi / 3, math.pi / 3, steps)  # yaw, pitch, roll
-        roll_grid = torch.linspace(-math.pi / 2, math.pi / 2, steps)  # yaw, pitch, roll
+        rot_grid = torch.linspace(-math.pi / 3, math.pi / 3, steps)  # yaw, pitch, roll
         dx_grid = torch.linspace(-35, 35, steps)
         dy_grid = torch.linspace(850, 950, steps)
         dz_grid = torch.linspace(-50, 50, steps)
         return {
-            "yaw": yaw_grid,
-            "pitch": pitch_grid,
-            "roll": roll_grid,
+            "rot": rot_grid,
             "dx": dx_grid,
             "dy": dy_grid,
             "dz": dz_grid,

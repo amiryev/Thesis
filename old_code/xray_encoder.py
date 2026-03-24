@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.models import vgg16, VGG16_Weights
 
-from utils import Sobel, DirectionalMambaBlock
+from old_code.utils import Sobel, DirectionalMambaBlock
 
 # NOTE: We keep imports light here; DRR/CT loading now happens in the dataset (train.py).
 

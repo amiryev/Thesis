@@ -11,9 +11,7 @@ from pytorch_msssim import ssim
 from torchvision.transforms.functional import gaussian_blur
 
 from diffdrr.metrics import MultiscaleNormalizedCrossCorrelation2d
-from utils import PositionLoss                   
-
-from utils import Sobel
+from old_code.utils import PositionLoss, Sobel
 
 class PoseOptimizer(nn.Module):
     def __init__(self,position_estimator):
@@ -65,8 +63,8 @@ class PoseOptimizer(nn.Module):
         self.position_loss = PositionLoss()
 
     def update_crm(self, crm):
-        self.crm = gaussian_blur(crm, 5, 1.0)
-        # self.crm = crm
+        # self.crm = gaussian_blur(crm, 5, 1.0)
+        self.crm = crm
 
     def gain(self, projection, crm, scales=(128, 64, 32, 16, 8), weights=None):
         projection_gradients = self.sobel(projection) * self.kernel
