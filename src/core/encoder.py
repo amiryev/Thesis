@@ -19,6 +19,8 @@ class XrayEncoder(nn.Module):
         device=None,
         size: int = 128,
         patch_size: int = 32,
+        output_channels: int = 8192,
+        feature_mask:bool = True
     ):
         super().__init__()
         if device is None:
@@ -26,11 +28,18 @@ class XrayEncoder(nn.Module):
         self.device = device
         self.size = size
         self.ps = patch_size
+        
 
-        assert size % patch_size == 0, "size must be divisible by patch_size"
-        self.num_patches_h = size // patch_size
-        self.num_patches_w = size // patch_size
-        self.num_patches = self.num_patches_h * self.num_patches_w
+        if feature_mask:
+            assert size % 32 == 0, "size must be divisible by patch_size"
+            self.num_patches_h = size // 32
+            self.num_patches_w = size // 32
+            self.num_patches = self.num_patches_h * self.num_patches_w
+        else:
+            assert size % patch_size == 0, "size must be divisible by patch_size"
+            self.num_patches_h = size // patch_size
+            self.num_patches_w = size // patch_size
+            self.num_patches = self.num_patches_h * self.num_patches_w
 
         # Inputs: (x_masked, sobel_mag, sobel_orient) -> 3 channels to match VGG
         self.sobel = Sobel()
@@ -43,6 +52,10 @@ class XrayEncoder(nn.Module):
             dummy = torch.zeros(1, 3, self.size, self.size)
             feat = self.encoder(dummy)
             C, H, W = feat.shape[1:]  # skip batch dim
+
+        reduced_channels = output_channels // (H * W)
+        self.channel_reduce = nn.Conv2d(C, reduced_channels, kernel_size=1)
+        C = reduced_channels
 
         # Mamba over flattened spatial tokens with learned positional encoding
         self.positional_encoding = nn.Parameter(torch.zeros(H * W, C))
@@ -82,7 +95,7 @@ class XrayEncoder(nn.Module):
             nn.Sigmoid(),  # target images normalized to [0,1]
         )
 
-    def _make_patch_mask(self, B: int, mask_ratio: float):
+    def _make_feature_mask(self, B: int, mask_ratio: float):
         """Return patch-level mask as expanded pixel mask (B,1,H,W)."""
         ps = self.ps
         Hp, Wp = self.num_patches_h, self.num_patches_w
@@ -109,7 +122,8 @@ class XrayEncoder(nn.Module):
         B, C, H, W = x.shape
         assert C == 1, "Expect (B,1,H,W) grayscale input"
 
-        pixel_mask, patch_mask = self._make_patch_mask(B, mask_ratio)
+        pixel_mask, patch_mask = self._make_feature_mask(B, mask_ratio)
+        # patch_mask = self._make_patch_mask(B, mask_ratio)
 
         feats = self.encode(x, patch_mask=patch_mask)
 
@@ -119,13 +133,22 @@ class XrayEncoder(nn.Module):
 
 
     def encode(self, x: torch.Tensor, kernel=None, patch_mask: torch.Tensor = None):
-        mag, orient = self.sobel(x, return_orientation=True)  # (B,1,H,W) each
+        
+        # mask input image
+        # x_masked = x * (1 - patch_mask)
+
+        # Sobel from masked image (important!)
+        mag, orient = self.sobel(x, return_orientation=True)
+
         if kernel is not None:
             # Ensure kernel matches x shape if needed, mostly used for CRM masking
             x3 = torch.cat([x, mag, orient], dim=1) * kernel
         else:              # (B,3,H,W)
             x3 = torch.cat([x, mag, orient], dim=1)
+        
         x = self.encoder(x3)  # (B,512,4,4)
+
+        x = self.channel_reduce(x)
 
         B, C, H, W = x.shape
         tokens = x.view(B, C, H * W).permute(0, 2, 1)  # (B,L,C)

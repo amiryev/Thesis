@@ -51,7 +51,8 @@ class DDPHelper:
         os.environ['MASTER_ADDR'] = master_addr
         os.environ['MASTER_PORT'] = master_port
 
-        torch.cuda.set_device(rank)
+        device = torch.device(f"cuda:{rank % torch.cuda.device_count()}")
+        torch.cuda.set_device(device)
 
         dist.init_process_group(backend=backend, rank=rank, world_size=world_size, init_method='env://')
 

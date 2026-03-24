@@ -103,7 +103,7 @@ class PoseOptimizer(nn.Module):
         init_results = [] # To be populated
         final_results = []
 
-        for step in range(iters):        
+        for step in range(iters):
             self.optimizer.zero_grad()
             
             # Forward pass through the "trainable" encoder to get features of CRM
@@ -177,5 +177,172 @@ class PoseOptimizer(nn.Module):
                 break
         
         final_results = [best_gain.item(), position, features_mse_loss, features_cos_sim]
+
+        return best_pose, best_projection, step-patience, init_results, final_results
+
+
+class PoseGenerator(nn.Module):
+    """
+    Lightweight MLP to generate 6-DoF pose updates from a latent vector.
+    """
+    def __init__(self, latent_dim=32, hidden_dim=64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 6)
+        )
+
+    def forward(self, z):
+        return self.net(z)
+
+
+class LatentPoseOptimizer(nn.Module):
+    def __init__(self, position_estimator, latent_dim=32, hidden_dim=64, max_translation=10.0, max_rotation=0.1):
+        """
+        Latent Pose Optimizer optimizing a small neural network to output 
+        pose updates from a fixed random latent vector.
+        """
+        super().__init__()
+        self.position_estimator = position_estimator
+        self.position_estimator.eval()
+        
+        self.latent_dim = latent_dim
+        self.hidden_dim = hidden_dim
+        
+        # Scaling limits (6 DoF: 3 rotation, 3 translation)
+        self.max_translation = max_translation
+        self.max_rotation = max_rotation
+
+        self.sobel = Sobel()
+        self.register_buffer('kernel', self.position_estimator.kernel)
+        self.crm = None
+
+    def update_crm(self, crm):
+        # self.crm = image_processing.gaussian_blur_tensor(crm, 5, 1.0)
+        self.crm = crm
+
+    def gain(self, projection, crm, scales=(128, 64, 32, 16, 8), weights=None):
+        projection_gradients = self.sobel(projection) * self.kernel
+        crm_gradients = self.sobel(crm) * self.kernel
+
+        n_levels = len(scales)
+
+        if weights is None:
+            weights = torch.ones(n_levels, device=projection.device)
+
+        gain_fn = MultiscaleNormalizedCrossCorrelation2d(patch_sizes=scales, patch_weights=weights)
+
+        mncc_gain =  gain_fn(projection_gradients, crm_gradients)
+        return mncc_gain
+
+    def forward(
+        self,
+        lr: float = 1e-3,
+        iters: int = 250,
+        patience: int = 25,
+        min_delta: float = 1e-3,
+        iterative: bool = False,
+        verbose: bool = True,
+    ):
+        if self.crm is None:
+            raise RuntimeError("CRM not set. Call update_crm() first.")
+
+        # Initial prediction (using the position estimator)
+        with torch.no_grad():
+            projection, initial_pose = self.position_estimator(self.crm)
+            
+        device = initial_pose.device
+        B = initial_pose.shape[0]
+
+        # Initialize Pose Generator
+        model = PoseGenerator(latent_dim=self.latent_dim, hidden_dim=self.hidden_dim).to(device)
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr, maximize=True)
+        # optimizer = torch.optim.SGD(model.parameters(), lr=lr, maximize=True)
+        
+        # Fixed random latent vector
+        z = torch.randn(B, self.latent_dim, device=device)
+        # Constraint 1: explicitly constant
+        z.requires_grad = False
+        
+        max_range = torch.tensor([
+            self.max_rotation, self.max_rotation, self.max_rotation,
+            self.max_translation, self.max_translation, self.max_translation
+        ], device=device).unsqueeze(0)  # Shape: (1, 6)
+
+        best_pose = initial_pose.detach().clone()
+        best_gain = torch.full((B,), -float('inf'), device=device)
+        best_projection = projection.clone().detach()
+        best_model = copy.deepcopy(model.state_dict())
+
+        no_improve  = 0
+        init_gain = 0.0
+        
+        init_results = []
+        final_results = []
+
+        current_pose = initial_pose.detach().clone()
+
+        for step in range(iters):
+            optimizer.zero_grad()
+            
+            # Predict delta pose from the fixed latent vector
+            raw_output = model(z)
+            
+            # Constraint 3: Scale output with tanh (acts as clipping/clamping)
+            delta_pose = max_range * torch.tanh(raw_output)
+            
+            if iterative:
+                # Bonus: Iterative Version
+                optimize_pose = current_pose.detach() + delta_pose
+            else:
+                # Standard Version
+                optimize_pose = initial_pose.detach() + delta_pose
+                
+            # Render DRR using project
+            optimize_projection = self.position_estimator.project(optimize_pose)
+            
+            # Optimization objective: Maximize Gain
+            gain = self.gain(optimize_projection, self.crm)
+            
+            if step == 0:
+                init_gain = gain.max().item()
+                # Dummy values for features_mse_loss and features_cos_sim to match expected output format
+                init_results = [init_gain, initial_pose.clone(), 0.0, 0.0]
+
+            gain.sum().backward()
+            
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
+            # Update weights Using Adam
+            optimizer.step()
+            
+            if iterative:
+                # Prepare for next iteration
+                current_pose = optimize_pose.detach()
+
+            # Tracking best
+            improved = torch.logical_or(torch.isneginf(best_gain), gain > best_gain + min_delta * best_gain.abs())
+            if improved.any():
+                no_improve = 0
+                best_projection[improved] = optimize_projection[improved].detach().clone()
+                best_pose[improved] = optimize_pose[improved].detach().clone()
+                best_gain[improved] = gain[improved].detach().clone()
+                best_model = copy.deepcopy(model.state_dict())
+            else:
+                no_improve += 1
+
+            if verbose and step % 10 == 0:
+                print(f"[{step:03d}]  gain={gain.max():.5f}  best_max={best_gain.max():.5f}  no_improve={no_improve}")
+                
+            if no_improve >= patience or step == iters - 1 or torch.isnan(gain).any():
+                model.load_state_dict(best_model)
+                if verbose:
+                    print(f"Stop at step {step} (patience={patience})")
+                break
+
+        final_results = [best_gain.max().item(), best_pose.clone(), 0.0, 0.0]
 
         return best_pose, best_projection, step-patience, init_results, final_results

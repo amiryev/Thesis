@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import math
-from mamba_ssm import Mamba
+from mamba.mamba_ssm import Mamba
 
 class Sobel(nn.Module):
     """
