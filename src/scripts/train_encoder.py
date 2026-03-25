@@ -34,11 +34,10 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size per GPU")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
     parser.add_argument("--weight_decay", type=float, default=1e-2, help="Weight decay for optimizer")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--num_workers", type=int, default=0, help="Number of dataloader workers")
 
     # Encoder Specific
-    parser.add_argument("--mask_ratio", type=float, default=0.4, help="Ratio of patches to mask")
+    parser.add_argument("--mask_ratio", type=float, default=0.6, help="Ratio of patches to mask")
     parser.add_argument("--patch_size", type=int, default=config.PATCH_SIZE, help="Size of patches")
     
     # Paths
@@ -50,7 +49,7 @@ def parse_args():
 
     # Testing mode
     parser.add_argument("--on_the_fly", action="store_true", help="Generate DRR while training or use pre-generated dataset")
-    parser.add_argument("--gloo", action="store_true", help="Use GLOO istead of NCCL for parallelization")
+    parser.add_argument("--ddp", action="store_false", help="Use DDP parallelization")
     parser.add_argument("--test", action="store_true", help="Run in test mode to generate visuals and evaluate features")
 
     return parser.parse_args()
@@ -93,12 +92,11 @@ class EncoderTrainer:
         self.device = torch.device("cuda", rank)
         
         # Setup Distributed Environment
-        if args.gloo:
-            DDPHelper.setup(rank, world_size, backend='gloo')
-        else:
+        if args.ddp:
             DDPHelper.setup(rank, world_size)
 
-        torch.manual_seed(args.seed + rank)
+        seed = 42
+        torch.manual_seed(seed + rank)
         
         # Logging setup (Rank 0 only)
         self.logger = None
@@ -125,7 +123,8 @@ class EncoderTrainer:
         if not data_dir.exists():
             if self.rank == 0 and self.logger:
                 self.logger.error(f"Data directory not found at {data_dir}")
-            DDPHelper.cleanup()
+            if self.args.ddp:
+                DDPHelper.cleanup()
             sys.exit(1)
             
         if self.args.on_the_fly:
@@ -157,7 +156,11 @@ class EncoderTrainer:
             patch_size=self.args.patch_size
         ).to(self.device)
         
-        self.model = DDP(model, device_ids=[self.rank], find_unused_parameters=False)
+        if self.args.ddp:
+            self.model = DDP(model, device_ids=[self.rank], find_unused_parameters=False)
+        else:
+            self.model = model
+
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(), 
             lr=self.args.lr, 
@@ -275,7 +278,8 @@ class EncoderTrainer:
 
         if self.rank == 0 and self.logger:
             self.logger.info("Training complete.")
-        DDPHelper.cleanup()
+        if self.args.ddp:
+            DDPHelper.cleanup()
 
 
 class EncoderTester:
@@ -285,7 +289,6 @@ class EncoderTester:
     """
     def __init__(self, args: argparse.Namespace):
         self.args = args
-        # self.device = torch.device(f"cuda:{args.gpus.split(',')[0]}") if args.gpus and torch.cuda.is_available() else torch.device("cpu")
         self.device = config.DEVICE
         self.test_dir = self.args.output_dir
         if self.test_dir is None:
@@ -390,7 +393,8 @@ class EncoderTester:
                     patient_id = f"patient_{p_idx}"
                     subj, drr, grids, valid_indices = entry
                     
-                    indices = np.random.RandomState(self.args.seed).choice(
+                    seed = 42
+                    indices = np.random.RandomState(seed).choice(
                         len(valid_indices), min(num_per_patient, len(valid_indices)), replace=False
                     )
                     
@@ -528,13 +532,16 @@ def main():
         tester.run_all_tests(num_per_patient=5)
     # Train mode
     else:
-        # Auto-detect distributed availability
-        if torch.cuda.is_available():
-            world_size = torch.cuda.device_count()
-            print(f"Launching DDP training on {world_size} GPUs.")
-            DDPHelper.spawn(train_worker, world_size, args=(args,))
+        if args.ddp:
+            # Auto-detect distributed availability
+            if torch.cuda.is_available():
+                world_size = torch.cuda.device_count()
+                print(f"Launching DDP training on {world_size} GPUs.")
+                DDPHelper.spawn(train_worker, world_size, args=(args,))
+            else:
+                print("No CUDA device found. Running on CPU (single process).")
+                train_worker(0, 1, args)
         else:
-            print("No CUDA device found. Running on CPU (single process).")
             train_worker(0, 1, args)
 
 if __name__ == "__main__":

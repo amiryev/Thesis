@@ -8,7 +8,6 @@ import torch
 DATA_DIR = Path("/mnt/storage/users/amiry/git/Thesis/datasets")
 CT_DIR = DATA_DIR / "CT"
 CRM_DIR = DATA_DIR / "CRM"
-# OUTPUT_DIR = Path("outputs")
 OUTPUT_DIR = Path("/mnt/storage/users/amiry/git/Thesis/outputs")
 CKPT_DIR = Path("/mnt/storage/users/amiry/git/Thesis/checkpoints")
 
