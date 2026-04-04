@@ -34,7 +34,6 @@ class Sobel(nn.Module):
             return magnitude, orientation
         return magnitude
 
-
 class MambaBlock(nn.Module):
     def __init__(self, d_model=512, d_state=16, d_conv=4, expand=2, use_residual=True):
         super().__init__()
@@ -57,7 +56,6 @@ class MambaBlock(nn.Module):
         x = self.linear(x)       
         x = self.activation(x)        
         return x + residual          
-
 
 class DirectionalMambaBlock(nn.Module):
     """
@@ -150,3 +148,48 @@ class DirectionalMambaBlock(nn.Module):
         x = self.block(x)                                   # Mamba along that order
         x = x.index_select(dim=1, index=self.inv_perm)      # back to row-major
         return x
+
+class SpatialAttentionPool(nn.Module):
+    def __init__(self, in_channels, num_queries=4):
+        super().__init__()
+
+        self.attn = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels // 2, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels // 2, num_queries, 1)
+        )
+
+        self.norm = nn.LayerNorm(in_channels)
+
+    def forward(self, x):  # (B, C, H, W)
+        B, C, H, W = x.shape
+
+        attn = self.attn(x).reshape(B, -1, H * W)   # (B, Q, HW)
+        attn = torch.softmax(attn, dim=-1)
+
+        x_flat = x.reshape(B, C, H * W)             # (B, C, HW)
+
+        pooled = torch.bmm(attn, x_flat.transpose(1, 2))  # (B, Q, C)
+
+        pooled = self.norm(pooled)
+
+        return pooled.reshape(B, -1)  # (B, Q*C)
+    
+class AttentionPool(nn.Module):
+    def __init__(self, dim=512, num_queries=4, heads=4):
+        super().__init__()
+        self.queries = nn.Parameter(torch.randn(num_queries, dim))
+        self.attn = nn.MultiheadAttention(dim, heads, batch_first=True)
+        self.proj = nn.Linear(dim, dim)
+
+    def forward(self, x):  # (B, C, H, W)
+        B, C, H, W = x.shape
+        x = x.flatten(2).transpose(1, 2)  # (B, H*W, C)
+
+        Q = self.queries.unsqueeze(0).expand(B, -1, -1)  # (B, Q, C)
+
+        out, _ = self.attn(Q, x, x)  # (B, Q, C)
+        out = self.proj(out)
+
+        return out
+    

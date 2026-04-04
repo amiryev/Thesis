@@ -7,12 +7,12 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List
 import logging
 
-def setup_logger(name: str = "train", log_file: Optional[Path] = None, level=logging.INFO):
+def setup_logger(name: str = "log", log_file: Optional[Path] = None, level=logging.INFO):
     logger = logging.getLogger(name)
     logger.setLevel(level)
     logger.propagate = False # Prevent double logging
 
-    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    formatter = logging.Formatter('%(asctime)s - %(message)s')
 
     # Stream handler
     ch = logging.StreamHandler()

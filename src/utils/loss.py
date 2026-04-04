@@ -4,6 +4,7 @@ import torch.nn.functional as F
 
 from diffdrr.metrics import MultiscaleNormalizedCrossCorrelation2d as MGNCC
 
+from src.utils.image_processing import rotation_6d_to_matrix
 from src.core.layers import Sobel
 
 
@@ -255,3 +256,55 @@ class mGNCCLoss(nn.Module):
 
         mncc_gain = (gain_fn(porj_mag, carm_mag) + gain_fn(proj_ori, carm_ori)) / 2
         return mncc_gain / n_levels
+
+def compute_geodesic_distance(R1, R2):
+    """
+    Calculates Geodesic difference in Radians mapped accurately upon SO(3) domain
+    R1, R2: Both sizes (B, 3, 3)
+    """
+    if len(R1.shape) == 3:
+        R = torch.bmm(R1, R2.transpose(1, 2))
+        trace = R[:, 0, 0] + R[:, 1, 1] + R[:, 2, 2]
+    else:
+        R = R1.transpose(-1, -2) @ R2
+        trace = R.diagonal(dim1=-2, dim2=-1).sum(-1)
+
+    cos_theta = torch.clamp((trace - 1.0) / 2.0, -1.0 + 1e-6, 1.0 - 1e-6)
+    return torch.acos(cos_theta)
+
+def poseConsistencyLoss(pred, repeats: int = 4, weight : float = 0.005):
+    """
+    pred: (B * V, 9) → [6D rot | 3D trans]
+    """
+    Bv, D = pred.shape
+    V = repeats
+    if V <= 1:
+        return torch.tensor(0.0, device=pred.device, requires_grad=False)
+    assert Bv % V == 0
+    B = Bv // V
+
+    pred = pred.view(B, V, D)
+
+    rot6d = pred[..., :6]   # (B, V, 6)
+    trans = pred[..., 6:]   # (B, V, 3)
+
+    # convert rotations to matrices
+    R = rotation_6d_to_matrix(rot6d)  # (B, V, 3, 3)
+
+    # pairwise comparisons
+    R1 = R[:, :, None]   # (B, V, 1, 3, 3)
+    R2 = R[:, None, :]   # (B, 1, V, 3, 3)
+
+    rot_dist = compute_geodesic_distance(R1, R2)  # (B, V, V)
+
+    t1 = trans[:, :, None, :]  # (B, V, 1, 3)
+    t2 = trans[:, None, :, :]  # (B, 1, V, 3)
+
+    trans_dist = torch.norm(t1 - t2, dim=-1)  # (B, V, V)
+
+    # remove diagonal (same-view comparisons)
+    mask = ~torch.eye(V, dtype=torch.bool, device=pred.device)
+    rot_loss = rot_dist[:, mask].mean()
+    trans_loss = trans_dist[:, mask].mean()
+
+    return rot_loss + weight * trans_loss
