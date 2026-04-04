@@ -2,11 +2,16 @@ import copy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from diffdrr.metrics import MultiscaleNormalizedCrossCorrelation2d
 
+from diffdrr.metrics import MultiscaleNormalizedCrossCorrelation2d
+from diffdrr.drr import DRR
+from diffdrr.data import read
+from diffdrr.pose import euler_angles_to_matrix, matrix_to_rotation_6d, rotation_6d_to_matrix, matrix_to_euler_angles
+
+from src.core.pose_regressor import PoseRegressor
 from src.core.layers import Sobel
-from src.utils import image_processing
-from src.utils import loss as loss_utils
+from src.utils import config, image_processing
+from src.utils.loss import mGNCCLoss, compute_geodesic_distance
 
 class PoseOptimizer(nn.Module):
     def __init__(self, position_estimator):
@@ -181,23 +186,24 @@ class PoseOptimizer(nn.Module):
         return best_pose, best_projection, step-patience, init_results, final_results
 
 
+
 class PoseGenerator(nn.Module):
     """
     Lightweight MLP to generate 6-DoF pose updates from a latent vector.
     """
-    def __init__(self, latent_dim=32, hidden_dim=64):
+    def __init__(self, latent_dim=32, hidden_dim=64, out_dim=9):
         super().__init__()
+        self.out_dim = out_dim
         self.net = nn.Sequential(
             nn.Linear(latent_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, 6)
+            nn.Linear(hidden_dim, out_dim)
         )
 
     def forward(self, z):
         return self.net(z)
-
 
 class LatentPoseOptimizer(nn.Module):
     def __init__(self, position_estimator, latent_dim=32, hidden_dim=64, max_translation=10.0, max_rotation=0.1):
@@ -217,7 +223,8 @@ class LatentPoseOptimizer(nn.Module):
         self.max_rotation = max_rotation
 
         self.sobel = Sobel()
-        self.register_buffer('kernel', self.position_estimator.kernel)
+        # self.register_buffer('kernel', self.position_estimator.kernel)
+        self.kernel = 1
         self.crm = None
 
     def update_crm(self, crm):
@@ -236,10 +243,12 @@ class LatentPoseOptimizer(nn.Module):
         gain_fn = MultiscaleNormalizedCrossCorrelation2d(patch_sizes=scales, patch_weights=weights)
 
         mncc_gain =  gain_fn(projection_gradients, crm_gradients)
-        return mncc_gain
+        return mncc_gain / len(scales)
 
     def forward(
         self,
+        model = None,
+        input = None,
         lr: float = 1e-3,
         iters: int = 250,
         patience: int = 25,
@@ -252,26 +261,37 @@ class LatentPoseOptimizer(nn.Module):
 
         # Initial prediction (using the position estimator)
         with torch.no_grad():
-            projection, initial_pose = self.position_estimator(self.crm)
+            projection, initial_pose = self.position_estimator(self.crm, return_proj=True)
             
         device = initial_pose.device
         B = initial_pose.shape[0]
 
         # Initialize Pose Generator
-        model = PoseGenerator(latent_dim=self.latent_dim, hidden_dim=self.hidden_dim).to(device)
+        if model is None:
+            model = PoseGenerator(latent_dim=self.latent_dim, hidden_dim=self.hidden_dim).to(device)
         optimizer = torch.optim.Adam(model.parameters(), lr=lr, maximize=True)
         # optimizer = torch.optim.SGD(model.parameters(), lr=lr, maximize=True)
         
         # Fixed random latent vector
-        z = torch.randn(B, self.latent_dim, device=device)
+        if input is None:
+            z = torch.randn(B, self.latent_dim, device=device)
+        else:
+            z = input.clone()
         # Constraint 1: explicitly constant
         z.requires_grad = False
         
-        max_range = torch.tensor([
-            self.max_rotation, self.max_rotation, self.max_rotation,
-            self.max_translation, self.max_translation, self.max_translation
-        ], device=device).unsqueeze(0)  # Shape: (1, 6)
-
+        if model.out_dim == 6:
+            max_range = torch.tensor([
+                self.max_rotation, self.max_rotation, self.max_rotation,
+                self.max_translation, self.max_translation, self.max_translation
+            ], device=device).unsqueeze(0)  # Shape: (1, 6)
+        elif model.out_dim == 9:
+                max_range = torch.tensor([
+                self.max_rotation, self.max_rotation, self.max_rotation, self.max_rotation, self.max_rotation, self.max_rotation,
+                self.max_translation, self.max_translation, self.max_translation
+            ], device=device).unsqueeze(0)  # Shape: (1, 9)
+        print(max_range.sahpe)
+        
         best_pose = initial_pose.detach().clone()
         best_gain = torch.full((B,), -float('inf'), device=device)
         best_projection = projection.clone().detach()
@@ -334,7 +354,7 @@ class LatentPoseOptimizer(nn.Module):
             else:
                 no_improve += 1
 
-            if verbose and step % 10 == 0:
+            if verbose:
                 print(f"[{step:03d}]  gain={gain.max():.5f}  best_max={best_gain.max():.5f}  no_improve={no_improve}")
                 
             if no_improve >= patience or step == iters - 1 or torch.isnan(gain).any():
@@ -346,3 +366,425 @@ class LatentPoseOptimizer(nn.Module):
         final_results = [best_gain.max().item(), best_pose.clone(), 0.0, 0.0]
 
         return best_pose, best_projection, step-patience, init_results, final_results
+
+
+class PoseRegressorOptimizer(nn.Module):
+    def __init__(self, drr=None, latent_dim=32, hidden_dim=64, max_translation=10.0, max_rotation=0.1):
+        """
+        Pose Regressor Optimizer optimizing a small neural network to output 
+        pose updates from a fixed random latent vector, starting from an initial
+        pose predicted by a PoseRegressor.
+        """
+        super().__init__()
+        if drr is None:         
+            subject = read(volume=str(self.ct_volume_path), orientation="AP", center_volume=True)
+            self.drr = DRR(subject, sdd=config.SDD, height=config.IMAGE_SIZE, delx=config.DELX).to(self.device)
+        else:
+            self.drr = drr
+        
+        # Instantiate Pose Regressor locally
+        self.pose_regressor = PoseRegressor()
+        self.pose_regressor.eval()
+        
+        self.latent_dim = latent_dim
+        self.hidden_dim = hidden_dim
+        
+        # Scaling limits (6 DoF: 3 rotation, 3 translation)
+        self.max_translation = max_translation
+        self.max_rotation = max_rotation
+
+        self.mgncc = mGNCCLoss()
+        self.kernel = 1
+        self.carm = None
+
+    def update_carm(self, carm):
+        """
+        Update the current target CRM image for this optimization run.
+        """
+        self.carm = carm
+
+    def split_prediction(self, pose, parameterization=None):
+        if pose.shape[1] == 6:
+            rot = pose[:, :3]
+            trans = pose[:, 3:]
+            projection = self.drr(rot, trans, parameterization="euler_angles", convention="ZXY") if parameterization is not None else None
+        elif pose.shape[1] == 9:
+            rot = pose[:, :6]
+            trans = pose[:, 6:]
+            projection = self.drr(rot, trans, parameterization=parameterization) if parameterization is not None else None
+
+        return rot, trans, projection
+
+    def render_drr(self, pose, parameterization="euler_angles"):
+        """
+        Render a generic DRR from the pose and normalize similarly to PositionEstimator.
+        """
+
+        if parameterization is "euler_angles":
+            rot = pose[:, :3]
+            trans = pose[:, 3:]
+            projection = self.drr(rot, trans, parameterization="euler_angles", convention="ZXY")
+        else:
+            rot = pose[:, :6]
+            trans = pose[:, 6:]            
+            projection = self.drr(rot, trans, parameterization=parameterization)
+        mn = projection.amin(dim=(-2, -1), keepdim=True) 
+        mx = projection.amax(dim=(-2, -1), keepdim=True) 
+        projection = 1 - (projection - mn) / (mx - mn)
+        return projection
+
+    def compute_loss(self, gt_pose, pred_pose):
+            if gt_pose is None:
+                return None
+            
+            euler_gt = gt_pose[:, :3]
+            trans_gt = gt_pose[:, 3:]
+
+            rot_6d_pred, trans_pred, _ = self.split_prediction(pred_pose)
+
+            rot_matrix_gt = euler_angles_to_matrix(euler_gt, convention="ZXY")
+
+            rot_matrix_pred = rotation_6d_to_matrix(rot_6d_pred)
+
+            loss_rot = compute_geodesic_distance(rot_matrix_pred, rot_matrix_gt).mean()
+            
+            trans_scale = torch.tensor([40, 50, 40], device=config.DEVICE)
+            loss_trans_by_axis = F.smooth_l1_loss(trans_pred, trans_gt, reduction='none')  / trans_scale
+            loss_trans = loss_trans_by_axis.mean()
+
+            trans_weight = trans_scale = torch.tensor([1.0, 0.2, 1.0], device=config.DEVICE)
+            loss = loss_rot + (trans_weight * loss_trans_by_axis).mean()
+
+            return loss.item(), loss_rot.item(), loss_trans.item()
+
+    def forward(
+        self,
+        model = None,
+        gt_pose = None,
+        input_vec = None,
+        lr: float = 1e-3,
+        iters: int = 250,
+        patience: int = 25,
+        min_delta: float = 1e-3,
+        iterative: bool = True,
+        verbose: bool = True,
+    ):
+        if self.carm is None:
+            raise RuntimeError("C-arm not set. Call update_carm() first.")
+
+        # Initial prediction using the PoseRegressor
+        with torch.no_grad():
+            rotation_6d, translation = self.pose_regressor(self.carm)
+            
+            # Convert 6D Rotation to Matrix to Euler (ZXY)
+            rotation_matrix = image_processing.rotation_6d_to_matrix(rotation_6d)
+            euler_angles = image_processing.matrix_to_euler_angles(rotation_matrix, convention="ZXY")
+            
+            # Form final 6-element pose expected by render_drr
+            # initial_pose = torch.cat([euler_angles, translation], dim=-1)
+            initial_pose = torch.cat([rotation_6d, translation], dim=-1)
+            
+            projection = self.render_drr(initial_pose, parameterization="rotation_6d")
+            
+        device = initial_pose.device
+        B = initial_pose.shape[0]
+
+        # Initialize Pose Generator
+        if model is None:
+            model = PoseGenerator(latent_dim=self.latent_dim, hidden_dim=self.hidden_dim).to(device)
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr, maximize=True)
+        
+        # Fixed random latent vector
+        if input_vec is None:
+            z = torch.randn(B, self.latent_dim, device=device)
+        else:
+            z = input_vec.clone()
+        # Constraint: explicitly constant
+        z.requires_grad = False
+        
+        if model.out_dim == 6:
+            max_range = torch.tensor([
+                self.max_rotation, self.max_rotation, self.max_rotation,
+                self.max_translation, self.max_translation, self.max_translation
+            ], device=device).unsqueeze(0)  # Shape: (1, 6)
+        elif model.out_dim == 9:
+                max_range = torch.tensor([
+                self.max_rotation, self.max_rotation, self.max_rotation, self.max_rotation, self.max_rotation, self.max_rotation,
+                self.max_translation, self.max_translation, self.max_translation
+            ], device=device).unsqueeze(0)  # Shape: (1, 9)
+
+        best_pose = initial_pose.detach().clone()
+        best_gain = torch.full((B,), -float('inf'), device=device)
+        best_projection = projection.clone().detach()
+        best_model = copy.deepcopy(model.state_dict())
+
+        no_improve  = 0
+        init_gain = 0.0
+        
+        init_results = []
+        final_results = []
+
+        current_pose = initial_pose.detach().clone()
+
+        for step in range(iters):
+            optimizer.zero_grad()
+            
+            # Predict delta pose from the fixed latent vector
+            raw_output = model(z)
+            
+            # Scale output with tanh (acts as clipping/clamping)
+            delta_pose = max_range * torch.tanh(raw_output)
+            
+            if iterative:
+                optimize_pose = current_pose + delta_pose
+            else:
+                optimize_pose = initial_pose.detach() + delta_pose
+                
+            # Render DRR using local logic
+            optimize_projection = self.render_drr(optimize_pose, parameterization="rotation_6d")
+            
+            # Optimization objective: Maximize Gain (mGNCC)
+            gain = self.mgncc(optimize_projection, self.carm, kernel=self.kernel)
+            
+            if step == 0:
+                init_gain = gain.max().item()
+                init_results = [init_gain, initial_pose.clone(), 0.0, 0.0]
+
+            # Update weights Using Adam
+            gain.sum().backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            
+            losses = self.compute_loss(gt_pose=gt_pose, pred_pose=optimize_pose)
+
+            if iterative:
+                # Prepare for next iteration
+                current_pose = optimize_pose.detach()
+
+            # Tracking best
+            improved = torch.logical_or(torch.isneginf(best_gain), gain > best_gain + min_delta * best_gain.abs())
+            if improved.any():
+                no_improve = 0
+                best_projection[improved] = optimize_projection[improved].detach().clone()
+                best_pose[improved] = optimize_pose[improved].detach().clone()
+                best_gain[improved] = gain[improved].detach().clone()
+            else:
+                no_improve += 1
+
+            if verbose:
+                print(f"[{step:03d}] losses={losses} | gain={gain.max():.5f} | best_max={best_gain.max():.5f} | no_improve={no_improve}")
+                
+            if no_improve >= patience or step == iters - 1 or torch.isnan(gain).any():
+                model.load_state_dict(best_model)
+                if verbose:
+                    print(f"Stop at step {step} (patience={patience})")
+                break
+
+        final_results = [best_gain.max().item(), best_pose.clone(), 0.0, 0.0]
+
+        return best_pose, best_projection, step-patience, init_results, final_results
+
+
+
+
+class NewOptimizer(nn.Module):
+    def __init__(
+        self,
+        drr,
+        pose_regressor,
+        max_translation=10.0,
+        max_rotation=0.1,
+        lambda_reg=1e-3,
+        device="cuda",
+    ):
+        """
+        Refines an initial pose using gradient-based optimization
+        to maximize mGNCC similarity between DRR and C-arm image.
+
+        Args:
+            drr: Differentiable DRR renderer
+            pose_regressor: pretrained model giving initial pose
+            max_translation: clamp for translation updates
+            max_rotation: clamp for rotation updates (radians)
+            lambda_reg: regularization weight
+            device: torch device
+        """
+        super().__init__()
+
+        self.drr = drr
+        pose_regressor = PoseRegressor()
+        self.pose_regressor = pose_regressor.eval()
+        self.device = device
+
+        self.max_translation = max_translation
+        self.max_rotation = max_rotation
+        self.lambda_reg = lambda_reg
+
+        self.mgncc = mGNCCLoss()
+
+        # coarse → fine pyramid
+        self.scales = [4, 2, 1]
+
+    # --------------------------------------------------
+    # Utility functions
+    # --------------------------------------------------
+    def normalize(self, img):
+        """Min-max normalize safely"""
+        eps = 1e-6
+        mn = img.amin(dim=(-2, -1), keepdim=True)
+        mx = img.amax(dim=(-2, -1), keepdim=True)
+        return 1.0 - (img - mn) / (mx - mn + eps)
+
+    def blur(self, img, k):
+        """Simple blur via avg pooling"""
+        if k == 1:
+            return img
+        return F.avg_pool2d(img, kernel_size=k, stride=1, padding=k // 2)
+
+    def render_drr(self, pose):
+        """Render DRR from pose"""
+        rot = pose[:, :3]
+        trans = pose[:, 3:]
+
+        proj = self.drr(
+            rot,
+            trans,
+            parameterization="euler_angles",
+            convention="ZXY",
+        )
+
+        return self.normalize(proj)
+
+    def get_initial_pose(self, carm):
+        """Get initial pose from trained regressor"""
+        with torch.no_grad():
+            rot6d, trans = self.pose_regressor(carm)
+
+            R = image_processing.rotation_6d_to_matrix(rot6d)
+            euler = image_processing.matrix_to_euler_angles(
+                R, convention="ZXY"
+            )
+
+            pose = torch.cat([euler, trans], dim=-1)
+
+        return pose
+
+    # --------------------------------------------------
+    # Main Optimization
+    # --------------------------------------------------
+    def forward(
+        self,
+        carm,
+        iters_per_scale=100,
+        lr_rot=1e-2,
+        lr_trans=5e-2,
+        patience=15,
+        min_delta=1e-4,
+        verbose=True,
+    ):
+        """
+        Args:
+            carm: input DRR / C-arm image (B=1)
+        Returns:
+            best_pose: optimized pose (1, 6)
+            best_gain: final similarity score
+        """
+
+        assert carm.shape[0] == 1, "Batch size must be 1 for stability"
+
+        carm = carm.to(self.device)
+
+        # ----------------------------------
+        # Initial pose
+        # ----------------------------------
+        initial_pose = self.get_initial_pose(carm).detach()
+
+        # ----------------------------------
+        # Optimization variable
+        # ----------------------------------
+        delta_pose = nn.Parameter(torch.zeros_like(initial_pose))
+
+        optimizer = torch.optim.Adam([
+            {"params": delta_pose[:, :3], "lr": lr_rot},
+            {"params": delta_pose[:, 3:], "lr": lr_trans},
+        ])
+
+        # Pose limits
+        max_range = torch.tensor([
+            self.max_rotation, self.max_rotation, self.max_rotation,
+            self.max_translation, self.max_translation, self.max_translation
+        ], device=self.device).unsqueeze(0)
+
+        # Tracking
+        best_gain = -float("inf")
+        best_pose = initial_pose.clone()
+        no_improve = 0
+
+        # ----------------------------------
+        # Multi-scale optimization
+        # ----------------------------------
+        for scale in self.scales:
+
+            if verbose:
+                print(f"\n--- Scale {scale} ---")
+
+            for step in range(iters_per_scale):
+
+                optimizer.zero_grad()
+
+                # Bounded update
+                delta = max_range * torch.tanh(delta_pose)
+
+                pose = initial_pose + delta
+
+                # Render
+                proj = self.render_drr(pose)
+
+                # Multi-scale smoothing
+                proj_s = self.blur(proj, scale)
+                carm_s = self.blur(carm, scale)
+
+                # Similarity
+                gain = self.mgncc(proj_s, carm_s)
+
+                # Loss = maximize gain
+                reg = self.lambda_reg * delta.pow(2).mean()
+                loss = -gain.mean() + reg
+
+                # Safety check
+                if not torch.isfinite(loss):
+                    print("Numerical instability detected. Stopping.")
+                    break
+
+                loss.backward()
+
+                # Stabilize gradients
+                torch.nn.utils.clip_grad_norm_([delta_pose], 1.0)
+
+                optimizer.step()
+
+                gain_val = gain.item()
+
+                # Track best
+                if gain_val > best_gain + min_delta:
+                    best_gain = gain_val
+                    best_pose = pose.detach().clone()
+                    no_improve = 0
+                else:
+                    no_improve += 1
+
+                if verbose:
+                    print(
+                        f"[{step:03d}] "
+                        f"gain={gain_val:.5f} "
+                        f"best={best_gain:.5f} "
+                        f"no_improve={no_improve}"
+                    )
+
+                # Early stopping
+                if no_improve >= patience:
+                    if verbose:
+                        print("Early stopping triggered")
+                    break
+
+        return best_pose, best_gain

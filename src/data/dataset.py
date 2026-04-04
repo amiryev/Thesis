@@ -4,6 +4,8 @@ import math
 import itertools
 from pathlib import Path
 from typing import List, Tuple, Dict
+from collections import defaultdict
+import random
 
 import numpy as np
 import torch
@@ -123,7 +125,6 @@ class PoseDataset(Dataset):
 
         return rotation, translation
 
-
 class MultiPatientDRRDataset(Dataset):
     """
     Samples random DRR projections from *multiple* CTs for masked-image reconstruction.
@@ -139,7 +140,8 @@ class MultiPatientDRRDataset(Dataset):
         min_intersections: int = 750,
         samples_per_epoch: int = 10000,
         seed: int = 42,
-        patient_ids: tuple = (1, 11)
+        patient_ids: tuple = (1, 11),
+        return_pose: bool = False
     ):
         super().__init__()
         self.data_dir = Path(data_dir)
@@ -151,6 +153,7 @@ class MultiPatientDRRDataset(Dataset):
         self.min_intersections = min_intersections
         self.samples_per_epoch = samples_per_epoch
         self.rng = np.random.default_rng(seed)
+        self.return_pose = return_pose
 
         index_json = os.path.join(self.data_dir, "data_index.json")
         ct_files_all = self.load_ct_subset(index_json, patient_ids[0], patient_ids[1])
@@ -291,7 +294,7 @@ class MultiPatientDRRDataset(Dataset):
         translation = torch.tensor([dxg[index_tuple[3]], dyg[index_tuple[4]], dzg[index_tuple[5]]], device=device).unsqueeze(0)  # (1,3)
         return rotation, translation
 
-    def __getitem__(self, idx: int) -> torch.Tensor:
+    def __getitem__(self, idx: int):
         p_idx = self.rng.integers(0, len(self.entries))
         subj, drr, grids, valid_indices = self.entries[p_idx]
 
@@ -303,22 +306,31 @@ class MultiPatientDRRDataset(Dataset):
         proj = drr(rot, trans, parameterization="euler_angles", convention="ZXY").squeeze(0)
         proj = _normalize_projection(proj)
 
+        if self.return_pose:
+            pose = torch.cat([rot.squeeze(0), trans.squeeze(0)])
+            return proj, pose
+
         return proj  
 
 class DRRMetadataDataset(Dataset):
-    def __init__(self, root_dir, transform=None):
+    def __init__(self, root_dir, transform=None, return_pose: bool = False, valid_ids = None):
         self.root_dir = root_dir
         self.transform = transform
         self.samples = []
+        self.return_pose = return_pose
 
         # 1. Load the master index to find patient folders
         master_path = os.path.join(root_dir, 'master_index.json')
         with open(master_path, 'r') as f:
             patients = json.load(f)
-
+            
         # 2. Map every image to its specific metadata
+        patients = patients['entries'] if 'entries' in patients else patients
         for p in patients:
-            p_folder = p['folder']
+            p_id = int(p['id'])
+            if (valid_ids is not None) and (p_id not in valid_ids):
+                continue
+            p_folder = p['DRR'] if 'DRR' in p else p['folder']
             p_dir = os.path.join(root_dir, p_folder)
             
             # Load the specific patient's metadata
@@ -332,7 +344,8 @@ class DRRMetadataDataset(Dataset):
                     'path': os.path.join(p_dir, img_name),
                     'pose': torch.tensor(info['pose'], dtype=torch.float32),
                     'is_centered': int(info['is_centered']),
-                    'orientation': info['orientation']
+                    'orientation': info['orientation'],
+                    'id': int(p_id)
                 })
 
     def __len__(self):
@@ -351,9 +364,95 @@ class DRRMetadataDataset(Dataset):
             image = self.transform(image)
 
         # Return image and the pose (common target for DRR training)
-        # return {
-        #     'image': image,
-        #     'pose': sample['pose'],
-        #     'orientation': sample['orientation']
-        # }
+        if self.return_pose:
+            return image, sample['pose'], sample
+
         return image
+    
+
+class PairedDRRMetadataDataset(DRRMetadataDataset):
+    """
+    Dataset for loading paired DRRs (anchor + positive) from the same patient.
+
+    Inherits from DRRMetadataDataset and overrides __getitem__ to return
+    pairs instead of single samples, suitable for similarity-based training.
+
+    Args:
+        min_pose_diff (float): Minimum Euclidean distance between anchor and positive
+                               poses to avoid trivial similarity pairs.
+    """
+
+    def __init__(self, root_dir, transform=None, return_pose: bool = False, min_pose_diff: float = 0.0):
+        # Initialize parent class
+        super().__init__(root_dir, transform, return_pose)
+        self.min_pose_diff = min_pose_diff
+
+        # Build patient-to-sample index for fast positive sampling
+        self.patient_to_indices = defaultdict(list)
+        for i, sample in enumerate(self.samples):
+            self.patient_to_indices[sample["id"]].append(i)
+
+    def __getitem__(self, idx):
+        """
+        Returns a pair of DRRs (anchor and positive) from the same patient.
+
+        Args:
+            idx (int): Index of the anchor DRR
+
+        Returns:
+            tuple: (anchor_img, positive_img) or
+                   (anchor_img, positive_img, anchor_pose, positive_pose)
+        """
+        anchor_sample = self.samples[idx]
+        anchor_id = anchor_sample["id"]
+
+        # ---- Sample a positive image from same patient ----
+        candidate_indices = self.patient_to_indices[anchor_id]
+
+        if len(candidate_indices) > 1:
+            pos_idx = idx
+            # Ensure positive is different and meets min_pose_diff
+            while pos_idx == idx or (
+                self.min_pose_diff > 0.0 and
+                torch.norm(self.samples[pos_idx]["pose"] - anchor_sample["pose"]) < self.min_pose_diff
+            ):
+                pos_idx = random.choice(candidate_indices)
+        else:
+            # Edge case: only one sample for this patient
+            pos_idx = idx
+
+        positive_sample = self.samples[pos_idx]
+
+        # ---- Load images using parent class functionality ----
+        def load_image(sample):
+            img = io.read_image(sample["path"], mode=io.ImageReadMode.GRAY)
+            img = img.float() / 255.0  # normalize to [0,1]
+            if self.transform:
+                img = self.transform(img)
+            return img
+
+        anchor_img = load_image(anchor_sample)
+        positive_img = load_image(positive_sample)
+
+        if self.return_pose:
+            return (
+                anchor_img,
+                positive_img,
+                anchor_sample["pose"],
+                positive_sample["pose"],
+            )
+
+        return anchor_img, positive_img
+    
+
+class RepeatDataset(torch.utils.data.Dataset):
+    def __init__(self, dataset, repeats):
+        self.dataset = dataset
+        self.repeats = repeats
+
+    def __len__(self):
+        return len(self.dataset) * self.repeats
+
+    def __getitem__(self, idx):
+        real_idx = idx % len(self.dataset)
+        return self.dataset[real_idx]
