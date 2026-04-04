@@ -2,6 +2,7 @@ import os
 # os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,3,4"
 os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 import argparse
+import sys
 from pathlib import Path
 import time
 import datetime
@@ -17,8 +18,9 @@ import numpy as np
 
 from src.utils import config
 from src.core.encoder import XrayEncoder
-from src.data.dataset import MultiPatientDRRDataset, DRRMetadataDataset
+from src.data.dataset import MultiPatientDRRDataset, DRRMetadataDataset, PairedDRRMetadataDataset
 from src.utils.training import DDPHelper, CheckpointManager, AverageMeter, setup_logger, set_visible_devices
+from src.utils.loss import MaskedSSIMLoss, CosineSimilarityLoss
 
 def parse_args():
     """
@@ -72,12 +74,11 @@ def masked_l1_loss(pred: torch.Tensor, target: torch.Tensor, pixel_mask: torch.T
     denom = pixel_mask.sum().clamp_min(1.0)
     return diff.sum() / denom
 
-
 class EncoderTrainer:
     """
     Trainer class encapsulating the training logic for the XRay Encoder.
     """
-    def __init__(self, rank: int, world_size: int, args: argparse.Namespace):
+    def __init__(self, rank: int, world_size: int, args: argparse.Namespace, alpha: float = 0.7):
         """
         Initializes the trainer with distributed settings, models, and data loaders.
         
@@ -90,6 +91,7 @@ class EncoderTrainer:
         self.world_size = world_size
         self.args = args
         self.device = torch.device("cuda", rank)
+        self.alpha = alpha
         
         # Setup Distributed Environment
         if args.ddp:
@@ -103,7 +105,7 @@ class EncoderTrainer:
         if self.rank == 0:
             self.args.ckpt_dir.mkdir(parents=True, exist_ok=True)
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            self.logger = setup_logger("train_encoder", self.args.ckpt_dir / f"train_{timestamp}.log")
+            self.logger = setup_logger("train_encoder", self.args.ckpt_dir / f"encoder_{timestamp}.log")
             self.logger.info(f"Starting Encoder Training on {world_size} GPUs")
             self.logger.info(f"Arguments: {vars(args)}")
             
@@ -135,31 +137,32 @@ class EncoderTrainer:
                 patient_ids=(7, 11)
             )
         else:
-            self.dataset = DRRMetadataDataset(root_dir=data_dir)
+            # self.dataset = DRRMetadataDataset(root_dir=data_dir)
+            self.dataset = PairedDRRMetadataDataset(root_dir=data_dir)
 
         self.sampler = DistributedSampler(
             self.dataset, num_replicas=self.world_size, rank=self.rank, shuffle=True
-        )
+        ) if self.args.ddp else None
+
         self.loader = DataLoader(
             self.dataset, 
             batch_size=self.args.batch_size, 
             sampler=self.sampler, 
             num_workers=self.args.num_workers,
-            pin_memory=True
+            pin_memory=True,
+            shuffle=(self.sampler is None)
         )
 
     def _setup_model(self):
         """Initializes the encoder model, wraps it in DDP, and sets up the optimizer."""
-        model = XrayEncoder(
+        self.model = XrayEncoder(
             device=self.device, 
             size=config.IMAGE_SIZE, 
             patch_size=self.args.patch_size
         ).to(self.device)
         
         if self.args.ddp:
-            self.model = DDP(model, device_ids=[self.rank], find_unused_parameters=False)
-        else:
-            self.model = model
+            self.model = DDP(self.model, device_ids=[self.rank], find_unused_parameters=False)
 
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(), 
@@ -212,22 +215,33 @@ class EncoderTrainer:
         """
         self.model.train()
         meters = AverageMeter()
-        
+        ssim = MaskedSSIMLoss()
+        cos_sim = CosineSimilarityLoss()
+
         # Only show progress bar on rank 0
         if self.rank == 0:
             pbar = tqdm(self.loader, desc=f"Epoch {epoch}", leave=False)
         else:
             pbar = self.loader
 
-        for i, batch in enumerate(pbar):
-            imgs = batch.to(self.device, non_blocking=True)
+        # for i, batch in enumerate(pbar):
+        for i, (anchor, positive) in enumerate(pbar):
+            imgs, positive = anchor.to(self.device, non_blocking=True), positive.to(self.device, non_blocking=True)
             self.optimizer.zero_grad()
             
             # Forward pass provides reconstruction, mask, and latent representations
-            recon, pixel_mask, _ = self.model(imgs, mask_ratio=self.args.mask_ratio)
+            recon, pixel_mask, anchor_features = self.model(imgs, mask_ratio=self.args.mask_ratio)
+            pos_patch_mask, pos_feature_mask = self.model._make_feature_mask(len(positive), self.args.mask_ratio)
+            if len(pixel_mask.shape) == 4:
+                pos_mask = pos_patch_mask
+            else:
+                pos_mask = pos_feature_mask
+            pos_features = self.model.encode(positive, patch_mask=pos_mask)
             
             # Loss calculation against the masked pixels
-            loss = masked_l1_loss(recon, imgs, pixel_mask)
+            # l1_loss = masked_l1_loss(recon, imgs, pixel_mask)
+            # loss = ssim(recon, imgs, pixel_mask) + self.alpha * l1_loss + (1 - self.alpha) * cos_sim(anchor_features, pos_features)
+            loss = ssim(recon, imgs, pixel_mask) # + (0.01) * cos_sim(anchor_features, pos_features)
             loss.backward()
             self.optimizer.step()
             
@@ -246,7 +260,8 @@ class EncoderTrainer:
         
         start_time = time.time()
         for epoch in range(self.start_epoch, self.args.epochs):
-            self.sampler.set_epoch(epoch)
+            if self.sampler is not None:
+                self.sampler.set_epoch(epoch)
             avg_loss = self.train_one_epoch(epoch)
             
             if self.rank == 0:

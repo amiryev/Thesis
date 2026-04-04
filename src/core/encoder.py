@@ -2,6 +2,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 from torchvision.models import resnet50, ResNet50_Weights
+from torchvision.models import resnet18, ResNet18_Weights
 
 from src.core.layers import Sobel, DirectionalMambaBlock
 
@@ -20,17 +21,18 @@ class XrayEncoder(nn.Module):
         size: int = 128,
         patch_size: int = 32,
         output_channels: int = 8192,
-        feature_mask:bool = True
+        feature_mask:bool = False
     ):
         super().__init__()
         if device is None:
              device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.device = device
         self.size = size
-        self.ps = patch_size
+        self.patch_size = patch_size
+        self.feature_mask = feature_mask
+        # self.feature_mask = True
         
-
-        if feature_mask:
+        if self.feature_mask:
             assert size % 32 == 0, "size must be divisible by patch_size"
             self.num_patches_h = size // 32
             self.num_patches_w = size // 32
@@ -45,13 +47,13 @@ class XrayEncoder(nn.Module):
         self.sobel = Sobel()
 
         # Encoder backbone
-        resnet = resnet50(weights=ResNet50_Weights.DEFAULT)
+        resnet = resnet18(weights=ResNet18_Weights.DEFAULT)
         self.encoder = nn.Sequential(*list(resnet.children())[:-2])
         
         with torch.no_grad():
             dummy = torch.zeros(1, 3, self.size, self.size)
             feat = self.encoder(dummy)
-            C, H, W = feat.shape[1:]  # skip batch dim
+            C, H, W = feat.shape[1:]  # skip batch dim  
 
         reduced_channels = output_channels // (H * W)
         self.channel_reduce = nn.Conv2d(C, reduced_channels, kernel_size=1)
@@ -61,7 +63,12 @@ class XrayEncoder(nn.Module):
         self.positional_encoding = nn.Parameter(torch.zeros(H * W, C))
         torch.nn.init.trunc_normal_(self.positional_encoding, std=0.02)
 
-        self.mask_token = nn.Parameter(torch.zeros(C))
+        # Learned mask token
+        if self.feature_mask:
+            self.mask_token = nn.Parameter(torch.zeros(C))
+        else:
+            self.mask_token = nn.Parameter(torch.zeros(self.size, self.size))
+
         nn.init.normal_(self.mask_token, mean=0.0, std=0.02)
 
         directions = [
@@ -92,24 +99,24 @@ class XrayEncoder(nn.Module):
             nn.ConvTranspose2d(C//16,  C//32,  kernel_size=4, stride=2, padding=1),  # 64->128
             nn.ReLU(inplace=True),
             nn.Conv2d(C//32, 1, kernel_size=3, padding=1),
+            # nn.Conv2d(C//16, 1, kernel_size=3, padding=1),
             nn.Sigmoid(),  # target images normalized to [0,1]
         )
 
     def _make_feature_mask(self, B: int, mask_ratio: float):
         """Return patch-level mask as expanded pixel mask (B,1,H,W)."""
-        ps = self.ps
         Hp, Wp = self.num_patches_h, self.num_patches_w
-        L = Hp * Wp
+        L = self.num_patches
         num_mask = int(mask_ratio * L)
 
-        mask_patch = torch.zeros((B, L), device=self.device, dtype=torch.float32)
+        feature_mask = torch.zeros((B, L), device=self.device, dtype=torch.float32)
         for b in range(B):
             idx = torch.randperm(L, device=self.device)[:num_mask]
-            mask_patch[b, idx] = 1.0
+            feature_mask[b, idx] = 1.0
 
-        mask_grid = mask_patch.view(B, 1, Hp, Wp)
-        pixel_mask = mask_grid.repeat_interleave(ps, dim=2).repeat_interleave(ps, dim=3)
-        return pixel_mask, mask_patch  # (B,1,H,W), (B,L)
+        mask_grid = feature_mask.view(B, 1, Hp, Wp)
+        patch_mask = mask_grid.repeat_interleave(self.patch_size, dim=2).repeat_interleave(self.patch_size, dim=3)
+        return patch_mask, feature_mask  # (B,1,H,W), (B,L)
 
     def forward(self, x: torch.Tensor, mask_ratio: float):
         """
@@ -117,45 +124,51 @@ class XrayEncoder(nn.Module):
         returns:
           recon: (B,1,H,W)
           pixel_mask: (B,1,H,W) with 1 where masked
-          features: encoder features before decoder (B,512,4,4)
+          features: encoder features before decoder (B,C,Hp,Wp)
         """
         B, C, H, W = x.shape
         assert C == 1, "Expect (B,1,H,W) grayscale input"
 
-        pixel_mask, patch_mask = self._make_feature_mask(B, mask_ratio)
-        # patch_mask = self._make_patch_mask(B, mask_ratio)
+        patch_mask, feature_mask = self._make_feature_mask(B, mask_ratio)
 
-        feats = self.encode(x, patch_mask=patch_mask)
+        if self.feature_mask:
+            mask = feature_mask
+        else:
+            mask = patch_mask
+
+        feats = self.encode(x, patch_mask=mask)
 
         # Decode
         recon = self.decode(feats)                               # (B,1,H,W) ~[0,1]
-        return recon, pixel_mask, feats
+        return recon, mask, feats
 
 
     def encode(self, x: torch.Tensor, kernel=None, patch_mask: torch.Tensor = None):
         
         # mask input image
-        # x_masked = x * (1 - patch_mask)
+        if (patch_mask is not None) and (self.feature_mask is False):
+            x = x * (1 - patch_mask) + (self.mask_token * patch_mask)
+            # x = x * (1 - patch_mask)
 
         # Sobel from masked image (important!)
         mag, orient = self.sobel(x, return_orientation=True)
-
+        # mag, orient = x.clone(), x.clone()
+        
         if kernel is not None:
             # Ensure kernel matches x shape if needed, mostly used for CRM masking
             x3 = torch.cat([x, mag, orient], dim=1) * kernel
-        else:              # (B,3,H,W)
-            x3 = torch.cat([x, mag, orient], dim=1)
+        else:
+            x3 = torch.cat([x, mag, orient], dim=1) # (B,3,H,W)
         
-        x = self.encoder(x3)  # (B,512,4,4)
+        x = self.encoder(x3) # (B,256,H/32,W/32)
 
         x = self.channel_reduce(x)
 
         B, C, H, W = x.shape
         tokens = x.view(B, C, H * W).permute(0, 2, 1)  # (B,L,C)
 
-        if patch_mask is not None:
+        if (patch_mask is not None) and (self.feature_mask is True):
             mask = patch_mask.bool()
-            tokens = tokens.clone()
             tokens[mask] = self.mask_token
             # mask = patch_mask.unsqueeze(-1).float()   # (B, L, 1)
             # tokens = tokens * (1 - mask) + self.mask_token * mask
