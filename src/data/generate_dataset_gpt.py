@@ -47,6 +47,17 @@ def hu_windowing(vol, low=-1000, high=2000):
     # return np.clip(vol, 0, None)
     return vol.astype(np.float32)
 
+def load_volume(ct_path):
+    img = nib.load(str(ct_path))
+    img_ras = nib.as_closest_canonical(img)
+    # img_ras = img
+    vol = img_ras.get_fdata()
+
+    vol = hu_windowing(vol, -200, 1500)
+    new_affine = img_ras.affine
+
+    return nib.Nifti1Image(vol.astype(np.float32), new_affine)
+
 def rotation_distance(r1, r2):
     """
     r1, r2: (3,) Euler angles in radians (ZXY)
@@ -353,7 +364,8 @@ class DRRDataGenerator:
 
         while len(valid_rots) < n_targets and attempts < max_attempts:
             attempts += 1
-
+            if self.args.sampling_method == "orbit":
+                self.sample_pose_camOrb()
             if self.args.sampling_method == "mixture":
                 r, t = self.sample_pose_mixture()
             elif self.args.sampling_method == "uniform":
@@ -387,19 +399,74 @@ class DRRDataGenerator:
         return torch.stack(valid_rots), torch.stack(valid_trans)
 
     # --------------------------------------------------
+    # Pose sampler using a camera-orbit strategy (from GPT)
+    # --------------------------------------------------
+
+    def sample_pose_camOrb(self):
+        """
+        Sample a batch of poses.
+
+        The camera is positioned on a spherical arc around the spine and oriented
+        to look at the spine center.
+
+        Returns:
+            rot (torch.Tensor): Euler angles (ZXY convention), shape (B, 3), radians.
+            trans (torch.Tensor): Translations (camera position), shape (B, 3), mm.
+        """
+        B = self.batch_size
+        device = self.device
+
+        # Sample orbital (theta) and tilt (phi) angles
+        theta = torch.randn(B, device=device) * 20 * (torch.pi / 180)
+        phi   = torch.randn(B, device=device) * 10 * (torch.pi / 180)
+
+        # Sample distance from spine
+        r = self.base_depth + torch.randn(B, device=device) * 15
+
+        # Convert spherical coordinates to Cartesian (camera position)
+        x = r * torch.cos(phi) * torch.sin(theta)
+        y = r * torch.cos(phi) * torch.cos(theta)  # depth axis
+        z = r * torch.sin(phi)
+
+        trans = torch.stack([x, y, z], dim=1)
+
+        # Compute forward direction (camera → spine)
+        target = torch.tensor([0, self.base_depth, 0], device=device)
+        forward = target - trans
+        forward = forward / torch.norm(forward, dim=1, keepdim=True)
+
+        # Build orthonormal basis (right, up, forward)
+        up = torch.tensor([0, 0, 1], device=device).expand_as(forward)
+
+        right = torch.cross(up, forward, dim=1)
+        right = right / torch.norm(right, dim=1, keepdim=True)
+
+        up = torch.cross(forward, right, dim=1)
+
+        # Rotation matrix from basis vectors
+        R = torch.stack([right, up, forward], dim=2)
+
+        # Convert rotation matrix to Euler angles (ZXY)
+        rot = self.rotation_matrix_to_euler_zxy(R)
+
+        return rot, trans
+
+    # --------------------------------------------------
     # Main NIfTI pipeline
     # --------------------------------------------------
 
     def run_nifti(self):
         master_registry = []
         patient_id = self.args.index
-        patient_id = 31
+        # patient_id = 7
 
         nifti_files = sorted(Path(self.args.data_root).rglob("*.nii.gz"))
-        nifti_files = nifti_files[30:]
+        # import re
+        # patient_ids = [int(re.search(r"patient_(\d+)", f.parent.name).group(1)) for f in nifti_files]
 
-        for ct_path in tqdm(nifti_files, desc="Patients"):
-            patient_dir = Path(self.args.output_dir) / f"patient_{patient_id:03d}"
+        for idx, ct_path in enumerate(tqdm(nifti_files, desc="Patients")):
+            # patient_id = patient_ids[idx]
+            patient_dir = Path(self.args.output_dir) / f"patient_{patient_id:02d}/DRR_new"
             patient_dir.mkdir(parents=True, exist_ok=True)
 
             img = nib.load(str(ct_path))
@@ -408,41 +475,18 @@ class DRRDataGenerator:
             vol = img_ras.get_fdata()
 
             vol = hu_windowing(vol, -200, 1500)
-            # vol = hu_windowing(vol)
-
-            # vol = np.transpose(vol, (2, 0, 1))
-            # new_affine = img_ras.affine[:, [2, 0, 1, 3]]  # reorder spatial columns
-            # # Create new affine to match the transposed axes
-            # new_affine = np.zeros((4,4))
-            # new_affine[:3,0] = img_ras.affine[:3,2]  # original Z → new X
-            # new_affine[:3,1] = img_ras.affine[:3,0]  # original X → new Y
-            # new_affine[:3,2] = img_ras.affine[:3,1]  # original Y → new Z
-            # new_affine[:3,3] = img_ras.affine[:3,3]  # origin stays
-            # new_affine[3,3] = 1.0
             new_affine = img_ras.affine
+
+            vol = nib.Nifti1Image(vol.astype(np.float32), new_affine)
 
             tmp = tempfile.NamedTemporaryFile(suffix=".nii.gz", delete=False)
             tmp_path = Path(tmp.name)
 
             try:
                 # nib.save(img_ras, str(tmp_path))
-                nib.save(nib.Nifti1Image(vol.astype(np.float32), new_affine), str(tmp_path))
+                nib.save(vol, str(tmp_path))
 
                 subj = read(volume=str(tmp_path), orientation="AP", center_volume=True)
-
-                # print(f"CT path: {ct_path}")
-                # print(f"Volume shape: {subj.volume.shape}")
-                # print(f"Volume spacing: {subj.spacing}")
-                # print(f"Affine: {img_ras.affine}")
-                # print(f"Affine2: {img.affine}")
-
-                # shape = vol.shape
-                # spacing = img.header.get_zooms()  # should be (0.703, 0.703, 0.625)
-
-                # physical_size = tuple(s * z for s, z in zip(shape, spacing))
-                # print("Physical size (mm):", physical_size)
-                # print(f"Header spacing: {spacing}")
-                # print(f"Volume shape: {img.shape}")
 
                 # Multi-DELX option
                 delx = random.choice(self.args.delx_values)
@@ -534,7 +578,7 @@ if __name__ == "__main__":
 
     parser.add_argument("--base_depth", type=float, default=650.0)
 
-    parser.add_argument("--sampling_method", type=str, default="mixture", choices=["mixture", "uniform"])
+    parser.add_argument("--sampling_method", type=str, default="mixture", choices=["mixture", "uniform", "orbit"])
 
     args = parser.parse_args()
 

@@ -6,6 +6,7 @@ from diffdrr.metrics import MultiscaleNormalizedCrossCorrelation2d as MGNCC
 
 from src.utils.image_processing import rotation_6d_to_matrix
 from src.core.layers import Sobel
+from src.utils import config
 
 
 class PositionLoss(nn.Module):
@@ -223,12 +224,19 @@ class mGNCCLoss(nn.Module):
     This loss computes the gain between projection and target C-arm gradients
     across multiple scales using a set of differentiable Sobel filters.
     """
-    def __init__(self, scales=(128, 64, 32, 16, 8)):
+    def __init__(self, scales=(128, 64, 32, 16, 8), weights=None):
         super().__init__()
         self.scales = scales
         self.sobel = Sobel()
 
-    def forward(self, projection: torch.Tensor, carm: torch.Tensor, kernel=1, weights=None) -> torch.Tensor:
+        self.n_levels = len(self.scales)
+
+        if weights is None:
+            weights = torch.ones(self.n_levels, device=config.DEVICE)
+
+        self.gain_fn = MGNCC(patch_sizes=self.scales, patch_weights=weights)
+
+    def forward(self, projection: torch.Tensor, carm: torch.Tensor, kernel=1) -> torch.Tensor:
         """
         Computes the MNCC gain.
         
@@ -246,16 +254,8 @@ class mGNCCLoss(nn.Module):
         porj_mag, proj_ori = self.sobel(projection, return_orientation=True) * kernel
         carm_mag, carm_ori = self.sobel(carm, return_orientation=True) * kernel
 
-
-        n_levels = len(self.scales)
-
-        if weights is None:
-            weights = torch.ones(n_levels, device=projection.device)
-
-        gain_fn = MGNCC(patch_sizes=self.scales, patch_weights=weights)
-
-        mncc_gain = (gain_fn(porj_mag, carm_mag) + gain_fn(proj_ori, carm_ori)) / 2
-        return mncc_gain / n_levels
+        mncc_gain = (self.gain_fn(porj_mag, carm_mag) + self.gain_fn(proj_ori, carm_ori)) / 2
+        return mncc_gain / self.n_levels
 
 def compute_geodesic_distance(R1, R2):
     """
@@ -272,7 +272,7 @@ def compute_geodesic_distance(R1, R2):
     cos_theta = torch.clamp((trace - 1.0) / 2.0, -1.0 + 1e-6, 1.0 - 1e-6)
     return torch.acos(cos_theta)
 
-def poseConsistencyLoss(pred, repeats: int = 4, weight : float = 0.005):
+def poseConsistencyLoss(pred, repeats: int = 4, weight : float = 0.005, return_sum: bool = True):
     """
     pred: (B * V, 9) → [6D rot | 3D trans]
     """
@@ -307,4 +307,7 @@ def poseConsistencyLoss(pred, repeats: int = 4, weight : float = 0.005):
     rot_loss = rot_dist[:, mask].mean()
     trans_loss = trans_dist[:, mask].mean()
 
-    return rot_loss + weight * trans_loss
+    if return_sum:
+        return rot_loss + weight * trans_loss
+    else:
+        return rot_loss, weight * trans_loss

@@ -85,47 +85,6 @@ def augment_image(image, contrast_range=(-0.4, 0.4), brightness_range=(-0.4, 0.4
     
     return image_shades, image
 
-
-# class RandomGaussianNoise(torch.nn.Module):
-#     def __init__(self, std_range=(0.0, 0.05)):
-#         super().__init__()
-#         self.min_std, self.max_std = std_range
-
-#     def forward(self, img):
-#         std = random.uniform(self.min_std, self.max_std)
-#         if std == 0:
-#             return img
-#         noise = torch.randn_like(img) * std
-#         return torch.clamp(img + noise, 0.0, 1.0)
-
-# class RandomGamma(torch.nn.Module):
-#     def __init__(self, range=(0.5, 2.0)):
-#         super().__init__()
-#         self.min_gamma, self.max_gamma = range
-
-#     def forward(self, img):
-#         gamma = random.uniform(self.min_gamma, self.max_gamma)
-#         return TF.adjust_gamma(img, gamma)
-
-# class RandomGaussianBlur(torch.nn.Module):
-#     def __init__(self, sigma_range=(0.0, 1.5), kernel_size=9):
-#         super().__init__()
-#         self.blur = T.GaussianBlur(kernel_size=kernel_size, sigma=sigma_range)
-
-#     def forward(self, img):
-#         return self.blur(img)
-
-# class RandomContrast(torch.nn.Module):
-#     def __init__(self, range=(0.7, 1.3)):
-#         super().__init__()
-#         self.min_c, self.max_c = range
-
-#     def forward(self, img):
-#         c = random.uniform(self.min_c, self.max_c)
-#         return TF.adjust_contrast(img, c)
-
-# --- Rotational Math Utilities ---
-
 def euler_angles_to_matrix(euler_angles, convention="ZXY"):
     """
     Convert (B, 3) Euler angles in radians to a (B, 3, 3) rotation matrix.
@@ -251,40 +210,93 @@ class RandomContrast(torch.nn.Module):
         c = torch.empty(B, 1, 1, 1, device=img.device).uniform_(self.min_c, self.max_c)
         mean = img.mean(dim=(2, 3), keepdim=True)
         return torch.clamp((img - mean) * c + mean, 0.0, 1.0)
-    
+
 class RandomGaussianBlur(torch.nn.Module):
     def __init__(self, sigma_range=(0.0, 1.5), kernel_size=9):
         super().__init__()
         self.min_sigma, self.max_sigma = sigma_range
         self.kernel_size = kernel_size
-        self.blur = T.GaussianBlur(kernel_size=kernel_size, sigma=sigma_range)
+
+        # Precompute coordinate grid
+        k = kernel_size
+        coords = torch.arange(k) - k // 2
+        self.register_buffer("grid_x", coords.view(1, -1).repeat(k, 1))
+        self.register_buffer("grid_y", coords.view(-1, 1).repeat(1, k))
 
     def forward(self, imgs):
         """
-        img: (B, C, H, W)
+        imgs: (B, C, H, W)
         """
-        if imgs.dim() == 3:
-            imgs = imgs.unsqueeze(0)
-        imgs_out = torch.stack([self.blur(img) for img in imgs])
-        return imgs_out
-    
+        B, C, H, W = imgs.shape
+        device = imgs.device
+
+        # Sample sigma per image
+        sigma = torch.empty(B, device=device).uniform_(self.min_sigma, self.max_sigma)
+
+        # Avoid sigma = 0
+        sigma = sigma.clamp(min=1e-4)
+
+        # Compute Gaussian kernels (B, K, K)
+        x = self.grid_x.to(device)
+        y = self.grid_y.to(device)
+
+        kernel = torch.exp(-(x**2 + y**2).unsqueeze(0) / (2 * sigma.view(B, 1, 1)**2))
+        kernel = kernel / kernel.sum(dim=(1, 2), keepdim=True)
+
+        # Expand for depthwise conv
+        kernel = kernel.view(B, 1, self.kernel_size, self.kernel_size)
+        kernel = kernel.repeat(1, C, 1, 1)  # (B, C, K, K)
+
+        # Reshape for grouped conv
+        imgs = imgs.view(1, B * C, H, W)
+        kernel = kernel.view(B * C, 1, self.kernel_size, self.kernel_size)
+
+        out = F.conv2d(
+            imgs,
+            kernel,
+            padding=self.kernel_size // 2,
+            groups=B * C
+        )
+
+        return out.view(B, C, H, W)
+
 class RandomSpatialJitter(torch.nn.Module):
-    """
-    Small random affine transform that preserves pose label validity.
-    Translation and scale are small enough that the anatomical region 
-    stays in frame and the projection geometry is only minimally affected.
-    """
     def __init__(self, max_translate_frac=0.03, scale_range=(0.95, 1.05)):
         super().__init__()
         self.max_t = max_translate_frac
         self.scale_range = scale_range
 
     def forward(self, imgs):  # (B, C, H, W)
-        B, C, H, W = imgs.shape
-        out = []
-        for i in range(B):
-            tx = torch.FloatTensor(1).uniform_(-self.max_t, self.max_t).item() * W
-            ty = torch.FloatTensor(1).uniform_(-self.max_t, self.max_t).item() * H
-            sc = torch.FloatTensor(1).uniform_(*self.scale_range).item()
-            out.append(TF.affine(imgs[i], angle=0, translate=[tx, ty], scale=sc, shear=0))
-        return torch.stack(out)
+        B = imgs.shape[0]
+        device = imgs.device
+
+        # Sample parameters per image
+        tx = torch.empty(B, device=device).uniform_(-self.max_t, self.max_t)
+        ty = torch.empty(B, device=device).uniform_(-self.max_t, self.max_t)
+        scale = torch.empty(B, device=device).uniform_(*self.scale_range)
+
+        # Convert translation to normalized coords [-1, 1]
+        tx = tx * 2  # because grid_sample uses [-1,1]
+        ty = ty * 2
+
+        # Build affine matrices (B, 2, 3)
+        theta = torch.zeros(B, 2, 3, device=device)
+
+        theta[:, 0, 0] = scale
+        theta[:, 1, 1] = scale
+        theta[:, 0, 2] = tx
+        theta[:, 1, 2] = ty
+
+        # Generate grid
+        grid = F.affine_grid(theta, size=imgs.size(), align_corners=False)
+
+        # Sample
+        out = F.grid_sample(
+            imgs,
+            grid,
+            mode='bilinear',
+            padding_mode='border',
+            align_corners=False
+        )
+
+        return out

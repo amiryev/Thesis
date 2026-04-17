@@ -193,3 +193,28 @@ class AttentionPool(nn.Module):
 
         return out
     
+class StructuredSpatialPool(nn.Module):
+    """
+    Splits the feature map into a 2x2 grid of regions and pools each region
+    independently with both avg and max, then concatenates.
+    Forces the model to reason about 4 distinct spatial regions.
+    No learnable parameters → no collapse possible.
+    Output: (B, C * 4 * 2) = (B, C * 8) for a 2x2 grid with avg+max
+    """
+    def __init__(self, grid=(2, 2)):
+        super().__init__()
+        self.grid = grid
+
+    def forward(self, x):
+        # x: (B, C, H, W)
+        B, C, H, W = x.shape
+        gh, gw = self.grid
+        cell_h, cell_w = H // gh, W // gw
+        tokens = []
+        for i in range(gh):
+            for j in range(gw):
+                region = x[:, :, i*cell_h:(i+1)*cell_h, j*cell_w:(j+1)*cell_w]
+                tokens.append(region.amax(dim=(-2, -1)))   # max pool
+                tokens.append(region.mean(dim=(-2, -1)))   # avg pool
+        return torch.cat(tokens, dim=1)  # (B, C * 8)
+    

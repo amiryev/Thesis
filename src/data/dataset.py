@@ -8,10 +8,14 @@ from collections import defaultdict
 import random
 
 import numpy as np
+from PIL import Image
+
 import torch
 import torchvision.io as io
 from torch.utils.data import Dataset
 from torchio import Subject
+import torchvision.transforms as T
+import torchvision.transforms.functional as TF
 
 from diffdrr.data import read
 from diffdrr.drr import DRR
@@ -313,18 +317,23 @@ class MultiPatientDRRDataset(Dataset):
         return proj  
 
 class DRRMetadataDataset(Dataset):
-    def __init__(self, root_dir, transform=None, return_pose: bool = False, valid_ids = None):
+    def __init__(self, root_dir, transform=None, repeats: int = 0, return_pose: bool = False, valid_ids = None):
+        if repeats > 0:
+            assert callable(transform), "Transform must be a callable function/object when repeats > 0."
+
+        # Dataset parameters
         self.root_dir = root_dir
         self.transform = transform
         self.samples = []
         self.return_pose = return_pose
+        self.repeats = repeats
 
-        # 1. Load the master index to find patient folders
+        # Load the master index to find patient folders
         master_path = os.path.join(root_dir, 'master_index.json')
         with open(master_path, 'r') as f:
             patients = json.load(f)
             
-        # 2. Map every image to its specific metadata
+        # Map every image to its specific metadata
         patients = patients['entries'] if 'entries' in patients else patients
         for p in patients:
             p_id = int(p['id'])
@@ -348,6 +357,23 @@ class DRRMetadataDataset(Dataset):
                     'id': int(p_id)
                 })
 
+    def use_repeats(self, image, pose):
+        # Create list of image tensors (Original + N Transforms), each image is (1, H, W)
+        image = image.unsqueeze(0)  # (1, 1, H, W)
+        # images_list = [image] + [self.transform(image) for _ in range(self.repeats - 1)] # (N, 1, 1, H, W)
+        
+        # Stack images into one tensor: shape (N, 1, H, W)
+        # images = torch.stack(images_list).squeeze(1)
+
+        image_augmented = image.repeat_interleave(self.repeats - 1, dim=0) # (N-1, 1, H, W)
+        image_augmented = self.transform(image_augmented)
+        images = torch.cat([image, image_augmented], dim=0)  # (N, 1, H, W)
+
+        # Duplicate pose to match number of images, shape (N, 6)
+        poses = pose.repeat(self.repeats, 1)
+        
+        return images, poses
+
     def __len__(self):
         return len(self.samples)
 
@@ -355,10 +381,13 @@ class DRRMetadataDataset(Dataset):
         sample = self.samples[idx]
         
         # Load Image
-        image = io.read_image(sample['path'], mode=io.ImageReadMode.GRAY)
-    
+        image = Image.open(sample['path']).convert('L')
+        image = TF.to_tensor(image)
+        # image = io.read_image(sample['path'], mode=io.ImageReadMode.GRAY)
+
         # Convert to float and normalize to [0, 1]
-        image = image.float() / 255.0
+        # image = image.float() / 255.0
+        # image = T.ToTensor()(image)
 
         if self.transform:
             image = self.transform(image)
@@ -369,6 +398,30 @@ class DRRMetadataDataset(Dataset):
 
         return image
     
+    # def __getitem__(self, idx):
+    #     sample = self.samples[idx]
+        
+    #     # Load Image
+    #     image = Image.open(sample['path']).convert('L')
+    #     image = TF.to_tensor(image)
+    #     # image = io.read_image(sample['path'], mode=io.ImageReadMode.GRAY)
+
+    #     # Convert to float and normalize to [0, 1]
+    #     # image = torch.tensor(image.float() / 255.0)
+
+    #     # Load poses from dict
+    #     pose = torch.tensor(sample['pose'], dtype=torch.float32)
+
+    #     if self.repeats > 0:
+    #         image, pose = self.use_repeats(image, pose)
+    #     elif self.transform is not None:
+    #         image = self.transform(image)
+
+    #     # Return image and the pose (common target for DRR training)
+    #     if self.return_pose:
+    #         return image, pose, sample
+
+    #     return image
 
 class PairedDRRMetadataDataset(DRRMetadataDataset):
     """
