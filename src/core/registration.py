@@ -2,189 +2,16 @@ import copy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchvision.transforms.functional as TF
 
-from diffdrr.metrics import MultiscaleNormalizedCrossCorrelation2d
 from diffdrr.drr import DRR
 from diffdrr.data import read
-from diffdrr.pose import euler_angles_to_matrix, matrix_to_rotation_6d, rotation_6d_to_matrix, matrix_to_euler_angles
+from diffdrr.pose import euler_angles_to_matrix, rotation_6d_to_matrix
 
 from src.core.pose_regressor import PoseRegressor
 from src.core.layers import Sobel
 from src.utils import config, image_processing
 from src.utils.loss import mGNCCLoss, compute_geodesic_distance
-
-class PoseOptimizer(nn.Module):
-    def __init__(self, position_estimator):
-        super().__init__()
-        
-        self.position_estimator = position_estimator
-        self.position_estimator.eval() # Ensure estimator is in eval mode
-
-        self.encoder = self.position_estimator.encoder
-        # We need a copy of the encoder for reference features (orig_encoder) mechanism
-        # However, the original code essentially fine-tunes the encoder's *feature extraction*
-        # relative to the CRM.
-        self.orig_encoder = copy.deepcopy(self.encoder)
-
-        self.encoder.train()
-        self.orig_encoder.eval()
-
-        # Freeze everything initially
-        for p in self.position_estimator.parameters():  
-            p.requires_grad_(False) 
-        for p in self.orig_encoder.parameters():  
-            p.requires_grad_(False) 
-        for p in self.encoder.parameters():
-            p.requires_grad_(False)
-
-        # Unfreeze specific parts of the encoder for optimization
-        # In the original code: self.encoder.encoder.parameters() (The VGG features)
-        for p in self.encoder.encoder.parameters():
-            p.requires_grad_(True)
-            
-        # Hook for masking gradients on the very first conv layer of VGG 
-        # (Original: mask[:, 0, :, :] = 1.0)
-        # The logic was: keep only the gradient for the first channel (input image), 
-        # effectively ignoring Sobel channels during this specific backprop?
-        mask = torch.zeros_like(self.encoder.encoder[0].weight)
-        mask[:, 0, :, :] = 1.0
-        self.encoder.encoder[0].weight.register_hook(lambda grad: grad * mask.to(grad.device))
-
-        self.optimizer = torch.optim.SGD(
-                [
-                    {"params": self.encoder.encoder.parameters(), "lr": 0.5e-3},
-                ],
-                maximize=True,
-            )
-        
-        self.sobel = Sobel()
-        self.register_buffer('kernel', self.position_estimator.kernel)
-
-        self.crm = None
-    
-    def update_crm(self, crm):
-        # Apply Gaussian blur to CRM as preprocessing
-        self.crm = image_processing.gaussian_blur_tensor(crm, 5, 1.0)
-
-    def gain(self, projection, crm, scales=(128, 64, 32, 16, 8), weights=None):
-        projection_gradients = self.sobel(projection) * self.kernel
-        crm_gradients = self.sobel(crm) * self.kernel
-
-        # B = projection_gradients.size(0)
-        n_levels = len(scales)
-
-        if weights is None:
-            weights = torch.ones(n_levels, device=projection.device)
-
-        gain_fn = MultiscaleNormalizedCrossCorrelation2d(patch_sizes=scales, patch_weights=weights)
-
-        mncc_gain =  gain_fn(projection_gradients, crm_gradients)
-        return mncc_gain
-
-    def forward(
-        self,
-        iters: int = 250,
-        patience: int = 25,
-        min_delta: float = 1e-3,
-        verbose: bool = True,
-    ):  
-        if self.crm is None:
-            raise RuntimeError("CRM not set. Call update_crm() first.")
-
-        # Initial prediction
-        with torch.no_grad():
-            projection, pose = self.position_estimator(self.crm)
-
-        B = pose.shape[0]
-
-        best_pose = pose.detach().clone()
-        best_gain       = torch.full((B,), -float('inf'), device=pose.device)
-        best_projection = torch.zeros((B, 1, 128, 128), device=pose.device)
-        best_encoder = copy.deepcopy(self.encoder.encoder.state_dict())
-
-        no_improve  = 0   
-        init_gain = 0.0
-        
-        init_results = [] # To be populated
-        final_results = []
-
-        for step in range(iters):
-            self.optimizer.zero_grad()
-            
-            # Forward pass through the "trainable" encoder to get features of CRM
-            # Note: We pass kernel to mask inputs
-            crm_features = self.encoder.encode(self.crm, kernel=self.kernel)
-            
-            # Predict pose/projection from CRM features
-            projection, crm_pose  = self.position_estimator(crm_features, feat=True)
-            
-            if step == 0:
-                best_projection = projection.clone().detach()
-                
-                # Get baseline features from original (frozen) encoder on the projected image
-                with torch.no_grad():
-                    proj_features = self.orig_encoder.encode(best_projection, kernel=self.kernel)
-                    # For logging mostly
-                    # _, drr_pose = self.position_estimator(proj_features, feat=True)
-                
-                init_position = crm_pose.clone()
-                init_features_mse_loss = F.mse_loss(crm_features, proj_features).item()
-                init_features_cos_sim = F.cosine_similarity(crm_features, proj_features).mean().item()
-            
-            # Optimization objective: Maximize Gain (MNCC between projection and CRM)
-            gain = self.gain(projection, self.crm)
-
-            if step == 0:
-                init_gain = gain.item()
-                init_results = [init_gain, init_position, init_features_mse_loss, init_features_cos_sim]
-
-            gain.sum().backward()
-            self.optimizer.step()
-
-            # Tracking best
-            improved = torch.logical_or(torch.isneginf(best_gain), gain > best_gain + min_delta * best_gain.abs())
-            if improved:
-                no_improve  = 0
-                best_projection = projection.detach().clone()
-                best_pose   = crm_pose.detach().clone()
-                best_gain   = gain.detach().clone()
-                best_encoder = copy.deepcopy(self.encoder.encoder.state_dict())
-            else:
-                no_improve += 1
-
-            if verbose and step % 10 == 0:
-                msg = (
-                    f"[{step:03d}]  "
-                    f"gain={gain.max():.5f}  "
-                    f"best_max={best_gain.max():.5f}  "
-                    f"no_improve={no_improve}  "
-                )
-                print(msg)
-            
-            # Early stopping
-            if no_improve >= patience or step == iters-1 or torch.isnan(gain):
-                # Restore best model state
-                self.encoder.encoder.load_state_dict(best_encoder)
-                
-                # Final metrics computation
-                with torch.no_grad():
-                    proj_features = self.orig_encoder.encode(best_projection, kernel=self.kernel)
-                    crm_features = self.encoder.encode(self.crm, kernel=self.kernel)
-                    _, crm_pose  = self.position_estimator(crm_features, feat=True)
-
-                position = crm_pose.clone()
-                features_mse_loss = F.mse_loss(crm_features, proj_features).item()
-                features_cos_sim = F.cosine_similarity(crm_features, proj_features).mean().item()
-                
-                if verbose:
-                    print(f"Stop at step {step} (patience={patience})")
-                    print(f"features loss:{features_mse_loss}, feature sim:{features_cos_sim}")
-                break
-        
-        final_results = [best_gain.item(), position, features_mse_loss, features_cos_sim]
-
-        return best_pose, best_projection, step-patience, init_results, final_results
-
 
 
 class PoseGenerator(nn.Module):
@@ -205,171 +32,8 @@ class PoseGenerator(nn.Module):
     def forward(self, z):
         return self.net(z)
 
-class LatentPoseOptimizer(nn.Module):
-    def __init__(self, position_estimator, latent_dim=32, hidden_dim=64, max_translation=10.0, max_rotation=0.1):
-        """
-        Latent Pose Optimizer optimizing a small neural network to output 
-        pose updates from a fixed random latent vector.
-        """
-        super().__init__()
-        self.position_estimator = position_estimator
-        self.position_estimator.eval()
-        
-        self.latent_dim = latent_dim
-        self.hidden_dim = hidden_dim
-        
-        # Scaling limits (6 DoF: 3 rotation, 3 translation)
-        self.max_translation = max_translation
-        self.max_rotation = max_rotation
-
-        self.sobel = Sobel()
-        # self.register_buffer('kernel', self.position_estimator.kernel)
-        self.kernel = 1
-        self.crm = None
-
-    def update_crm(self, crm):
-        # self.crm = image_processing.gaussian_blur_tensor(crm, 5, 1.0)
-        self.crm = crm
-
-    def gain(self, projection, crm, scales=(128, 64, 32, 16, 8), weights=None):
-        projection_gradients = self.sobel(projection) * self.kernel
-        crm_gradients = self.sobel(crm) * self.kernel
-
-        n_levels = len(scales)
-
-        if weights is None:
-            weights = torch.ones(n_levels, device=projection.device)
-
-        gain_fn = MultiscaleNormalizedCrossCorrelation2d(patch_sizes=scales, patch_weights=weights)
-
-        mncc_gain =  gain_fn(projection_gradients, crm_gradients)
-        return mncc_gain / len(scales)
-
-    def forward(
-        self,
-        model = None,
-        input = None,
-        lr: float = 1e-3,
-        iters: int = 250,
-        patience: int = 25,
-        min_delta: float = 1e-3,
-        iterative: bool = False,
-        verbose: bool = True,
-    ):
-        if self.crm is None:
-            raise RuntimeError("CRM not set. Call update_crm() first.")
-
-        # Initial prediction (using the position estimator)
-        with torch.no_grad():
-            projection, initial_pose = self.position_estimator(self.crm, return_proj=True)
-            
-        device = initial_pose.device
-        B = initial_pose.shape[0]
-
-        # Initialize Pose Generator
-        if model is None:
-            model = PoseGenerator(latent_dim=self.latent_dim, hidden_dim=self.hidden_dim).to(device)
-        optimizer = torch.optim.Adam(model.parameters(), lr=lr, maximize=True)
-        # optimizer = torch.optim.SGD(model.parameters(), lr=lr, maximize=True)
-        
-        # Fixed random latent vector
-        if input is None:
-            z = torch.randn(B, self.latent_dim, device=device)
-        else:
-            z = input.clone()
-        # Constraint 1: explicitly constant
-        z.requires_grad = False
-        
-        if model.out_dim == 6:
-            max_range = torch.tensor([
-                self.max_rotation, self.max_rotation, self.max_rotation,
-                self.max_translation, self.max_translation, self.max_translation
-            ], device=device).unsqueeze(0)  # Shape: (1, 6)
-        elif model.out_dim == 9:
-                max_range = torch.tensor([
-                self.max_rotation, self.max_rotation, self.max_rotation, self.max_rotation, self.max_rotation, self.max_rotation,
-                self.max_translation, self.max_translation, self.max_translation
-            ], device=device).unsqueeze(0)  # Shape: (1, 9)
-        print(max_range.sahpe)
-        
-        best_pose = initial_pose.detach().clone()
-        best_gain = torch.full((B,), -float('inf'), device=device)
-        best_projection = projection.clone().detach()
-        best_model = copy.deepcopy(model.state_dict())
-
-        no_improve  = 0
-        init_gain = 0.0
-        
-        init_results = []
-        final_results = []
-
-        current_pose = initial_pose.detach().clone()
-
-        for step in range(iters):
-            optimizer.zero_grad()
-            
-            # Predict delta pose from the fixed latent vector
-            raw_output = model(z)
-            
-            # Constraint 3: Scale output with tanh (acts as clipping/clamping)
-            delta_pose = max_range * torch.tanh(raw_output)
-            
-            if iterative:
-                # Bonus: Iterative Version
-                optimize_pose = current_pose.detach() + delta_pose
-            else:
-                # Standard Version
-                optimize_pose = initial_pose.detach() + delta_pose
-                
-            # Render DRR using project
-            optimize_projection = self.position_estimator.project(optimize_pose)
-            
-            # Optimization objective: Maximize Gain
-            gain = self.gain(optimize_projection, self.crm)
-            
-            if step == 0:
-                init_gain = gain.max().item()
-                # Dummy values for features_mse_loss and features_cos_sim to match expected output format
-                init_results = [init_gain, initial_pose.clone(), 0.0, 0.0]
-
-            gain.sum().backward()
-            
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            
-            # Update weights Using Adam
-            optimizer.step()
-            
-            if iterative:
-                # Prepare for next iteration
-                current_pose = optimize_pose.detach()
-
-            # Tracking best
-            improved = torch.logical_or(torch.isneginf(best_gain), gain > best_gain + min_delta * best_gain.abs())
-            if improved.any():
-                no_improve = 0
-                best_projection[improved] = optimize_projection[improved].detach().clone()
-                best_pose[improved] = optimize_pose[improved].detach().clone()
-                best_gain[improved] = gain[improved].detach().clone()
-                best_model = copy.deepcopy(model.state_dict())
-            else:
-                no_improve += 1
-
-            if verbose:
-                print(f"[{step:03d}]  gain={gain.max():.5f}  best_max={best_gain.max():.5f}  no_improve={no_improve}")
-                
-            if no_improve >= patience or step == iters - 1 or torch.isnan(gain).any():
-                model.load_state_dict(best_model)
-                if verbose:
-                    print(f"Stop at step {step} (patience={patience})")
-                break
-
-        final_results = [best_gain.max().item(), best_pose.clone(), 0.0, 0.0]
-
-        return best_pose, best_projection, step-patience, init_results, final_results
-
-
 class PoseRegressorOptimizer(nn.Module):
-    def __init__(self, drr=None, latent_dim=32, hidden_dim=64, max_translation=10.0, max_rotation=0.1):
+    def __init__(self, drr=None, latent_dim=32, hidden_dim=16, max_translation=10.0, max_rotation=0.1):
         """
         Pose Regressor Optimizer optimizing a small neural network to output 
         pose updates from a fixed random latent vector, starting from an initial
@@ -587,16 +251,8 @@ class PoseRegressorOptimizer(nn.Module):
 
 
 
-class NewOptimizer(nn.Module):
-    def __init__(
-        self,
-        drr,
-        pose_regressor,
-        max_translation=10.0,
-        max_rotation=0.1,
-        lambda_reg=1e-3,
-        device="cuda",
-    ):
+class LBFGSOptimizer(nn.Module):
+    def __init__(self, ct_path, loss:callable=mGNCCLoss(), rot_dim:int=3, lr=(1e-3, 5e-3), weight_decay=0.0, scales:int=3, device=config.DEVICE):
         """
         Refines an initial pose using gradient-based optimization
         to maximize mGNCC similarity between DRR and C-arm image.
@@ -610,78 +266,54 @@ class NewOptimizer(nn.Module):
             device: torch device
         """
         super().__init__()
-
-        self.drr = drr
-        pose_regressor = PoseRegressor()
-        self.pose_regressor = pose_regressor.eval()
         self.device = device
+        self.criterion = loss
+        self.rot_dim = rot_dim
+        self.lr = lr
+        self.weight_decay = weight_decay
 
-        self.max_translation = max_translation
-        self.max_rotation = max_rotation
-        self.lambda_reg = lambda_reg
-
-        self.mgncc = mGNCCLoss()
+        self.subject = read(volume=str(ct_path), orientation="AP", center_volume=True)
 
         # coarse → fine pyramid
-        self.scales = [4, 2, 1]
+        self.scales = [2**(s-1) for s in range(scales, 0, -1)]
 
     # --------------------------------------------------
     # Utility functions
     # --------------------------------------------------
-    def normalize(self, img):
+    def normalize(self, img, invert=True):
         """Min-max normalize safely"""
         eps = 1e-6
         mn = img.amin(dim=(-2, -1), keepdim=True)
         mx = img.amax(dim=(-2, -1), keepdim=True)
-        return 1.0 - (img - mn) / (mx - mn + eps)
+        if invert:
+            out = 1.0 - (img - mn) / (mx - mn + eps)
+        else:
+            out = (img - mn) / (mx - mn + eps)
+        return out
 
-    def blur(self, img, k):
+    def resize(self, img, size):
         """Simple blur via avg pooling"""
-        if k == 1:
+        if size == img.shape[1]:
             return img
-        return F.avg_pool2d(img, kernel_size=k, stride=1, padding=k // 2)
+        return F.interpolate(img, size=(size, size), mode='bilinear', align_corners=False)
 
-    def render_drr(self, pose):
+    def render_drr(self, pose, drr=None, img_size=config.IMAGE_SIZE):
         """Render DRR from pose"""
         rot = pose[:, :3]
         trans = pose[:, 3:]
 
-        proj = self.drr(
-            rot,
-            trans,
-            parameterization="euler_angles",
-            convention="ZXY",
-        )
+        if drr is None:
+            delx = 305 / img_size
+            print(f"Rendered image size is {img_size}")
+            drr = DRR(self.subject, sdd=config.SDD, height=img_size, delx=delx).to(self.device)
+        proj = drr(rot, trans, parameterization="euler_angles", convention="ZXY")
 
-        return self.normalize(proj)
-
-    def get_initial_pose(self, carm):
-        """Get initial pose from trained regressor"""
-        with torch.no_grad():
-            rot6d, trans = self.pose_regressor(carm)
-
-            R = image_processing.rotation_6d_to_matrix(rot6d)
-            euler = image_processing.matrix_to_euler_angles(
-                R, convention="ZXY"
-            )
-
-            pose = torch.cat([euler, trans], dim=-1)
-
-        return pose
+        return self.normalize(proj).to(self.device)
 
     # --------------------------------------------------
     # Main Optimization
     # --------------------------------------------------
-    def forward(
-        self,
-        carm,
-        iters_per_scale=100,
-        lr_rot=1e-2,
-        lr_trans=5e-2,
-        patience=15,
-        min_delta=1e-4,
-        verbose=True,
-    ):
+    def forward(self, carm, initial_pose, kernel=1.0, iters_per_scale=100, patience=15, verbose=True):
         """
         Args:
             carm: input DRR / C-arm image (B=1)
@@ -689,81 +321,84 @@ class NewOptimizer(nn.Module):
             best_pose: optimized pose (1, 6)
             best_gain: final similarity score
         """
-
-        assert carm.shape[0] == 1, "Batch size must be 1 for stability"
-
-        carm = carm.to(self.device)
-
-        # ----------------------------------
-        # Initial pose
-        # ----------------------------------
-        initial_pose = self.get_initial_pose(carm).detach()
+        min_delta = 1e-4
+        B, C, H, W = carm.shape
+        history = {}
 
         # ----------------------------------
         # Optimization variable
         # ----------------------------------
-        delta_pose = nn.Parameter(torch.zeros_like(initial_pose))
+        delta_pose = nn.Parameter(torch.zeros_like(initial_pose), requires_grad=True)
+        # delta_rot = nn.Parameter(torch.zeros_like(initial_pose[:, :self.rot_dim]), requires_grad=True)
+        # delta_trans = nn.Parameter(torch.zeros_like(initial_pose[:, self.rot_dim:]), requires_grad=True)
+        # torch.nn.init.kaiming_normal_(delta_pose)
 
-        optimizer = torch.optim.Adam([
-            {"params": delta_pose[:, :3], "lr": lr_rot},
-            {"params": delta_pose[:, 3:], "lr": lr_trans},
-        ])
+        # optimizer = torch.optim.LBFGS([
+        #     {"params": delta_rot,   "lr": self.lr[0], "weight_decay": self.weight_decay},
+        #     {"params": delta_trans, "lr": self.lr[1], "weight_decay": self.weight_decay},
+        # ])
+        optimizer = torch.optim.LBFGS([delta_pose], lr=self.lr[0])
 
-        # Pose limits
-        max_range = torch.tensor([
-            self.max_rotation, self.max_rotation, self.max_rotation,
-            self.max_translation, self.max_translation, self.max_translation
-        ], device=self.device).unsqueeze(0)
+        # # Pose limits
+        # max_range = torch.tensor([
+        #     self.max_rotation, self.max_rotation, self.max_rotation,
+        #     self.max_translation, self.max_translation, self.max_translation
+        # ], device=self.device).unsqueeze(0)
+
 
         # Tracking
         best_gain = -float("inf")
         best_pose = initial_pose.clone()
         no_improve = 0
 
+        initial_pose = initial_pose.detach()
+
         # ----------------------------------
         # Multi-scale optimization
         # ----------------------------------
         for scale in self.scales:
+            img_size = H // scale
+            drr = DRR(self.subject, sdd=config.SDD, height=img_size, delx=config.DELX).to(self.device)
+
+            carm_s = self.resize(carm, img_size).detach()
 
             if verbose:
                 print(f"\n--- Scale {scale} ---")
 
             for step in range(iters_per_scale):
+                # print(fr"$\delta$ pose: {delta_pose}")
+                def closure():
+                    optimizer.zero_grad()
 
-                optimizer.zero_grad()
+                    pose = initial_pose + delta_pose   # ❗ no detach
 
-                # Bounded update
-                delta = max_range * torch.tanh(delta_pose)
+                    proj = self.render_drr(pose, drr)
+                    proj = proj * kernel
+                    proj_s = self.resize(proj, img_size)
 
-                pose = initial_pose + delta
+                    gain = self.criterion(proj_s, carm_s)
+                    loss = 1 - gain.mean()
 
-                # Render
-                proj = self.render_drr(pose)
+                    loss.backward()
 
-                # Multi-scale smoothing
-                proj_s = self.blur(proj, scale)
-                carm_s = self.blur(carm, scale)
+                    torch.nn.utils.clip_grad_norm_([delta_pose], 1.0)
 
-                # Similarity
-                gain = self.mgncc(proj_s, carm_s)
-
-                # Loss = maximize gain
-                reg = self.lambda_reg * delta.pow(2).mean()
-                loss = -gain.mean() + reg
+                    return loss
+                
+                loss = optimizer.step(closure=closure)
 
                 # Safety check
                 if not torch.isfinite(loss):
                     print("Numerical instability detected. Stopping.")
                     break
 
-                loss.backward()
-
-                # Stabilize gradients
-                torch.nn.utils.clip_grad_norm_([delta_pose], 1.0)
-
-                optimizer.step()
-
+                with torch.no_grad():
+                    pose = initial_pose + delta_pose
+                    proj = self.render_drr(pose, drr)
+                    proj_s = self.resize(proj, img_size)
+                    gain = self.criterion(proj_s, carm_s)
                 gain_val = gain.item()
+                print("grad norm:", delta_pose.grad.norm().item())
 
                 # Track best
                 if gain_val > best_gain + min_delta:
@@ -772,6 +407,11 @@ class NewOptimizer(nn.Module):
                     no_improve = 0
                 else:
                     no_improve += 1
+
+                # Store history
+                history.setdefault("gain",       []).append(gain_val)
+                history.setdefault("delta_pose", []).append(delta_pose.detach().clone().cpu().tolist())
+                history.setdefault("estimated_pose", []).append(pose.detach().clone().cpu().tolist())
 
                 if verbose:
                     print(
@@ -787,4 +427,459 @@ class NewOptimizer(nn.Module):
                         print("Early stopping triggered")
                     break
 
-        return best_pose, best_gain
+        return best_pose, best_gain, history
+
+
+class AdamOptimizer(nn.Module):
+    def __init__(self, ct_path, loss:callable=mGNCCLoss(), rot_dim:int=3, lr=(1e-3, 5e-3), weight_decay=0.0, scales:int=3, device=config.DEVICE):
+        """
+        Refines an initial pose using gradient-based optimization
+        to maximize mGNCC similarity between DRR and C-arm image.
+
+        Args:
+            drr: Differentiable DRR renderer
+            pose_regressor: pretrained model giving initial pose
+            max_translation: clamp for translation updates
+            max_rotation: clamp for rotation updates (radians)
+            lambda_reg: regularization weight
+            device: torch device
+        """
+        super().__init__()
+        self.device = device
+        self.criterion = loss
+        self.rot_dim = rot_dim
+        self.lr = lr
+        self.weight_decay = weight_decay
+
+        self.subject = read(volume=str(ct_path), orientation="AP", center_volume=True)
+
+        # coarse → fine pyramid
+        self.scales = [2**(s-1) for s in range(scales, 0, -1)]
+
+    # --------------------------------------------------
+    # Utility functions
+    # --------------------------------------------------
+    def normalize(self, img, invert=True):
+        """Min-max normalize safely"""
+        eps = 1e-6
+        mn = img.amin(dim=(-2, -1), keepdim=True)
+        mx = img.amax(dim=(-2, -1), keepdim=True)
+        if invert:
+            out = 1.0 - (img - mn) / (mx - mn + eps)
+        else:
+            out = (img - mn) / (mx - mn + eps)
+        return out
+
+    def resize(self, img, size):
+        """Simple blur via avg pooling"""
+        if size == img.shape[1]:
+            return img
+        return F.interpolate(img, size=(size, size), mode='bilinear', align_corners=False)
+
+    def render_drr(self, pose, drr=None, img_size=config.IMAGE_SIZE):
+        """Render DRR from pose"""
+        rot = pose[:, :3]
+        trans = pose[:, 3:]
+
+        if drr is None:
+            delx = 305 / img_size
+            print(f"Rendered image size is {img_size}")
+            drr = DRR(self.subject, sdd=config.SDD, height=img_size, delx=delx).to(self.device)
+        proj = drr(rot, trans, parameterization="euler_angles", convention="ZXY")
+
+        return self.normalize(proj).to(self.device)
+
+    def find_closest_depth(self, carm, pose:torch.tensor, max_dist=100, size=10):
+        img_size = carm.shape[2]
+        depth = pose[0, -2]
+        depth_list = torch.linspace(depth - max_dist, depth + max_dist, size)
+        poses = pose.repeat(size, 1)
+        poses[:, -2] = depth_list
+
+        carm_s = self.resize(carm, img_size).detach()
+
+        
+        drrs = self.render_drr(poses, img_size=img_size)
+        carms = torch.cat(size * [carm_s])
+        # carms = carm_s.repeat(size)
+        gain = self.criterion(drrs, carms)
+        index = torch.argmax(gain)
+        print(pose)
+        print(gain)
+        print(poses[index])
+        return poses[index].unsqueeze(0)
+    
+    # --------------------------------------------------
+    # Main Optimization
+    # --------------------------------------------------
+    def forward(self, carm, initial_pose, kernel=1.0, iters_per_scale=100, patience=15, verbose=True):
+        """
+        Args:
+            carm: input DRR / C-arm image (B=1)
+        Returns:
+            best_pose: optimized pose (1, 6)
+            best_gain: final similarity score
+        """
+        min_delta = 1e-4
+        B, C, H, W = carm.shape
+        history = {}
+        # trans_scale = 100
+        trans_scale = torch.tensor([10, 200, 10], device=self.device, requires_grad=False)
+
+        # ----------------------------------
+        # Optimization variable
+        # ----------------------------------
+        # delta_pose = nn.Parameter(torch.zeros_like(initial_pose), requires_grad=True)
+        delta_rot = nn.Parameter(torch.zeros_like(initial_pose[:, :self.rot_dim]), requires_grad=True)
+        delta_trans = nn.Parameter(torch.zeros_like(initial_pose[:, self.rot_dim:]), requires_grad=True)
+        # delta_trans = nn.Parameter(torch.zeros((1,2), device=self.device), requires_grad=True)
+        # torch.nn.init.kaiming_normal_(delta_pose)
+
+        optimizer = torch.optim.AdamW([
+            {"params": delta_rot,   "lr": self.lr[0], "weight_decay": self.weight_decay},
+            {"params": delta_trans, "lr": self.lr[1], "weight_decay": self.weight_decay},
+        ])
+
+
+        # # Pose limits
+        # max_range = torch.tensor([
+        #     self.max_rotation, self.max_rotation, self.max_rotation,
+        #     self.max_translation, self.max_translation, self.max_translation
+        # ], device=self.device).unsqueeze(0)
+
+        # Estimate best depth
+        # initial_pose = self.find_closest_depth(carm, initial_pose)
+
+        # Tracking
+        best_gain = -float("inf")
+        best_pose = initial_pose.clone()
+        no_improve = 0
+
+        initial_pose = initial_pose.detach()
+
+        # ----------------------------------
+        # Multi-scale optimization
+        # ----------------------------------
+        for scale in self.scales:
+            no_improve = 0
+            img_size = H // scale
+            delx = 305 / img_size
+            print(f"Rendered image size is {H}")
+            drr = DRR(self.subject, sdd=config.SDD, height=img_size, delx=delx).to(self.device)
+
+            carm_s = self.resize(carm, img_size).detach()
+            if not type(kernel) is float:
+                import torchvision.transforms.functional as TF
+                kernel = TF.resize(kernel, img_size).detach()
+
+            # Tracking
+            best_gain = -float("inf")
+            best_pose = initial_pose.clone()
+            no_improve = 0
+
+            if verbose:
+                print(f"\n--- Scale {scale} ---")
+                pose = initial_pose.clone()
+                pose[:, :3] += delta_rot
+                pose[:, 3:] += delta_trans * trans_scale
+                print(f"Current pose: {pose} ---")
+
+            for step in range(iters_per_scale):
+                optimizer.zero_grad()
+                
+                rot_scale = 0.3     # ~28°
+                trans_scale = 30.0  # mm
+
+                # rot_update = rot_scale * torch.tanh(delta_rot)
+                # trans_update = trans_scale * torch.tanh(delta_trans)
+                pose = initial_pose.clone()
+                pose[:, :3] += delta_rot
+                pose[:, 3:] += delta_trans * trans_scale
+                # pose[:, :3] += rot_update
+                # pose[:, 3:] += trans_update
+                # pose[:, 0] += trans_update[:, 0]
+                # pose[:, 2] += trans_update[:, 1]
+
+                proj = self.render_drr(pose, drr)
+                # import torchvision.transforms.functional as TF
+                # proj = TF.gaussian_blur(proj, 7, 1.0)
+                proj_s = proj * kernel
+                # proj_s = self.resize(proj, img_size)
+
+                gain = self.criterion(proj_s, carm_s)
+                loss = 1 - gain.mean()
+
+                # Safety check
+                if not torch.isfinite(loss):
+                    print("Numerical instability detected. Stopping.")
+                    break
+
+                loss.backward()
+
+                torch.nn.utils.clip_grad_norm_([delta_rot, delta_trans], 1.0)
+            
+                optimizer.step()
+
+                gain_val = gain.item()
+                # print("rot grad:", delta_rot.grad.norm().item(), "trans grad:", delta_trans.grad.norm().item())
+
+                # Track best
+                if gain_val > best_gain + min_delta:
+                    best_gain = gain_val
+                    best_pose = pose.detach().clone()
+                    no_improve = 0
+                else:
+                    no_improve += 1
+
+                # Store history
+                history.setdefault("gain",       []).append(gain_val)
+                history.setdefault("delta_pose", []).append(torch.cat([delta_rot, delta_trans * trans_scale], dim=-1).detach().clone().cpu().tolist())
+                history.setdefault("estimated_pose", []).append(pose.detach().clone().cpu().tolist())
+
+                if verbose:
+                    print(
+                        f"[{step:03d}] "
+                        f"gain={gain_val:.5f} "
+                        f"best={best_gain:.5f} "
+                        f"no_improve={no_improve}"
+                    )
+
+                # Early stopping
+                if no_improve >= patience:
+                    if verbose:
+                        print("Early stopping triggered")
+                    break
+
+        return best_pose, best_gain, history
+
+
+class Optimizer(nn.Module):
+    def __init__(self, ct_path, loss:callable=mGNCCLoss(), lr=(1e-3, 5e-3), weight_decay=0.0, scales:int=3, device=config.DEVICE):
+        """
+        Refines an initial pose using gradient-based optimization
+        to maximize mGNCC similarity between DRR and C-arm image.
+
+        Args:
+            drr: Differentiable DRR renderer
+            pose_regressor: pretrained model giving initial pose
+            max_translation: clamp for translation updates
+            max_rotation: clamp for rotation updates (radians)
+            lambda_reg: regularization weight
+            device: torch device
+        """
+        super().__init__()
+        self.device = device
+        self.criterion = loss
+        self.lr = lr
+        self.weight_decay = weight_decay
+
+        self.subject = read(volume=str(ct_path), orientation="AP", center_volume=True)
+        self.trans_scale = torch.tensor([30, 500, 30], device=self.device, requires_grad=False)
+
+        # coarse → fine pyramid
+        self.scales = [2**(s-1) for s in range(scales, 0, -1)]
+
+    # --------------------------------------------------
+    # Utility functions
+    # --------------------------------------------------
+    def normalize(self, img, invert=True):
+        """Min-max normalize safely"""
+        eps = 1e-6
+        mn = img.amin(dim=(-2, -1), keepdim=True)
+        mx = img.amax(dim=(-2, -1), keepdim=True)
+        if invert:
+            out = 1.0 - (img - mn) / (mx - mn + eps)
+        else:
+            out = (img - mn) / (mx - mn + eps)
+        return out
+
+    def resize(self, img, new_size, sigma: float=0.25):
+        """Simple blur via avg pooling"""
+        img_size = img.shape[-1]
+        if new_size == img_size:
+            return img
+        scale = (new_size // img_size) if (new_size > img_size) else (img_size // new_size)
+        out = TF.gaussian_blur(img, kernel_size=7, sigma=(sigma * scale))
+        return TF.resize(out, new_size)
+
+    def render_drr(self, pose, drr=None, img_size=config.IMAGE_SIZE):
+        """Render DRR from pose"""
+        rot = pose[:, :3]
+        trans = pose[:, 3:]
+
+        if drr is None:
+            delx = 305 / img_size
+            print(f"Rendered image size is {img_size}")
+            drr = DRR(self.subject, sdd=config.SDD, height=img_size, delx=delx).to(self.device)
+        proj = drr(rot, trans, parameterization="euler_angles", convention="ZXY")
+
+        return self.normalize(proj).to(self.device)
+
+    def find_closest_depth(self, carm, pose:torch.tensor, max_dist=100, size=10):
+        img_size = carm.shape[2]
+        depth = pose[0, -2]
+        depth_list = torch.linspace(depth - max_dist, depth + max_dist, size)
+        poses = pose.repeat(size, 1)
+        poses[:, -2] = depth_list
+
+        carm_s = self.resize(carm, img_size).detach()
+
+        
+        drrs = self.render_drr(poses, img_size=img_size)
+        carms = torch.cat(size * [carm_s])
+        # carms = carm_s.repeat(size)
+        gain = self.criterion(drrs, carms)
+        index = torch.argmax(gain)
+        print(pose)
+        print(gain)
+        print(poses[index])
+        return poses[index].unsqueeze(0)
+
+    def add_delta_pose(self, pose, delta_rot, delta_trans):
+
+        pose[:, :3] += delta_rot
+        pose[:, 3:] += delta_trans * self.trans_scale
+        return pose
+
+
+    def closure(self, optimizer, carm, pose, kernel=1.0):
+        optimizer.zero_grad()
+
+        img_size = carm.shape[-1]
+        proj = self.render_drr(pose)
+        proj = proj * kernel
+        proj_s = self.resize(proj, img_size)
+
+        gain = self.criterion(proj_s, carm)
+        loss = 1 - gain.mean()
+
+        loss.backward()
+
+        return loss
+    
+    # --------------------------------------------------
+    # Main Optimization
+    # --------------------------------------------------
+    def forward(self, carm, initial_pose, kernel=1.0, iters_per_scale=100, patience=15, lbfgs:bool=False, verbose=True):
+        """
+        Args:
+            carm: input DRR / C-arm image (B=1)
+        Returns:
+            best_pose: optimized pose (1, 6)
+            best_gain: final similarity score
+        """
+        # General parameters
+        min_delta = 1e-4
+        carm_size = carm.shape[-1]
+        history = {}
+        
+        # ----------------------------------
+        # Optimization variable
+        # ----------------------------------
+        if lbfgs:
+            delta_pose = nn.Parameter(torch.zeros_like(initial_pose), requires_grad=True)
+            optimizer = torch.optim.LBFGS([delta_pose], lr=self.lr[0])
+        else:
+            delta_rot = nn.Parameter(torch.zeros_like(initial_pose[:, :-3]), requires_grad=True)
+            delta_trans = nn.Parameter(torch.zeros_like(initial_pose[:, -3:]), requires_grad=True)
+            # delta_trans = nn.Parameter(torch.zeros((1,2), device=self.device), requires_grad=True)
+            # torch.nn.init.kaiming_normal_(delta_pose)
+            optimizer = torch.optim.AdamW([
+                {"params": delta_rot,   "lr": self.lr[0], "weight_decay": self.weight_decay},
+                {"params": delta_trans, "lr": self.lr[1], "weight_decay": self.weight_decay},
+            ])
+
+
+        # # Pose limits
+        # max_range = torch.tensor([
+        #     self.max_rotation, self.max_rotation, self.max_rotation,
+        #     self.max_translation, self.max_translation, self.max_translation
+        # ], device=self.device).unsqueeze(0)
+
+        # Estimate best depth
+        # initial_pose = self.find_closest_depth(carm, initial_pose)
+
+        initial_pose = initial_pose.detach()
+        pose = self.add_delta_pose(initial_pose.clone(), delta_rot, delta_trans)
+
+        # ----------------------------------
+        # Multi-scale optimization
+        # ----------------------------------
+        for scale in self.scales:
+            # Reset Optimization Parameters
+            best_gain = -float("inf")
+            best_pose = initial_pose.clone()
+            no_improve = 0
+            img_size = carm_size // scale
+            delx = 305 / img_size
+            drr = DRR(self.subject, sdd=config.SDD, height=img_size, delx=delx).to(self.device)
+
+            # Resize C-arm and kernel
+            carm_s = self.resize(carm, img_size).detach()
+            if not type(kernel) is float:
+                kernel = TF.resize(kernel, img_size).detach()
+
+            if verbose:
+                print(f"\n--- Scale {scale} ---")
+                print(f"Current pose: {pose} ---")
+
+            for step in range(iters_per_scale):
+                optimizer.zero_grad()
+                
+                # rot_scale = 0.3     # ~28°
+                # trans_scale = 30.0  # mm
+
+                # rot_update = rot_scale * torch.tanh(delta_rot)
+                # trans_update = trans_scale * torch.tanh(delta_trans)
+                pose = self.add_delta_pose(initial_pose.clone(), delta_rot, delta_trans)
+
+                proj = self.render_drr(pose, drr)
+                # proj = TF.gaussian_blur(proj, 7, 1.0)
+                proj_s = proj * kernel
+            
+                gain = self.criterion(proj_s, carm_s, None)
+                loss = 1 - gain.mean()
+
+                # Safety check
+                if not torch.isfinite(loss):
+                    print("Numerical instability detected. Stopping.")
+                    break
+
+                loss.backward()
+
+                torch.nn.utils.clip_grad_norm_([delta_rot, delta_trans], 1.0)
+            
+                optimizer.step()
+
+                gain_val = gain.item()
+                # print("rot grad:", delta_rot.grad.norm().item(), "trans grad:", delta_trans.grad.norm().item())
+
+                # Track best
+                if gain_val > best_gain + min_delta:
+                    best_gain = gain_val
+                    best_pose = pose.detach().clone()
+                    no_improve = 0
+                else:
+                    no_improve += 1
+
+                # Store history
+                history.setdefault("gain",       []).append(gain_val)
+                history.setdefault("delta_pose", []).append(torch.cat([delta_rot, delta_trans * self.trans_scale], dim=-1).detach().clone().cpu().tolist())
+                history.setdefault("estimated_pose", []).append(pose.detach().clone().cpu().tolist())
+
+                if verbose:
+                    print(
+                        f"[{step:03d}] "
+                        f"gain={gain_val:.5f} "
+                        f"best={best_gain:.5f} "
+                        f"no_improve={no_improve}"
+                    )
+
+                # Early stopping
+                if no_improve >= patience:
+                    if verbose:
+                        print("Early stopping triggered")
+                    break
+
+        return best_pose, best_gain, history
+

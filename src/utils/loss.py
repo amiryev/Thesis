@@ -3,6 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from diffdrr.metrics import MultiscaleNormalizedCrossCorrelation2d as MGNCC
+from diffdrr.metrics import GradientNormalizedCrossCorrelation2d as GNCC
+from diffdrr.metrics import NormalizedCrossCorrelation2d as NCC
 
 from src.utils.image_processing import rotation_6d_to_matrix
 from src.core.layers import Sobel
@@ -234,7 +236,11 @@ class mGNCCLoss(nn.Module):
         if weights is None:
             weights = torch.ones(self.n_levels, device=config.DEVICE)
 
-        self.gain_fn = MGNCC(patch_sizes=self.scales, patch_weights=weights)
+        # self.gain_fn = MGNCC(patch_sizes=self.scales, patch_weights=weights)
+        # self.gain_fn = GNCC()
+        # self.gain_fn = GNCC(patch_size=32)
+        # self.gain_fn = NCC(patch_size=8)
+        self.gain_fn = NCC()
 
     def forward(self, projection: torch.Tensor, carm: torch.Tensor, kernel=1) -> torch.Tensor:
         """
@@ -251,11 +257,172 @@ class mGNCCLoss(nn.Module):
         """
         # projection_gradients = self.sobel(projection) * kernel
         # carm_gradients = self.sobel(carm) * kernel
+        from torchvision.transforms.functional import gaussian_blur
+        projection = gaussian_blur(projection, 5, 1.0)
+        carm = gaussian_blur(carm, 5, 1.0)
         porj_mag, proj_ori = self.sobel(projection, return_orientation=True) * kernel
         carm_mag, carm_ori = self.sobel(carm, return_orientation=True) * kernel
 
-        mncc_gain = (self.gain_fn(porj_mag, carm_mag) + self.gain_fn(proj_ori, carm_ori)) / 2
-        return mncc_gain / self.n_levels
+        # mncc_gain = (self.gain_fn(porj_mag, carm_mag) + self.gain_fn(proj_ori, carm_ori)) / 2
+        # mncc_gain = self.gain_fn(porj_mag, carm_mag)
+        mncc_gain = self.gain_fn(projection, carm)
+        # return mncc_gain / self.n_levels
+        return mncc_gain
+
+class LocalNCC(nn.Module):
+    def __init__(self, patch_size=9, stride=1, eps=1e-5, min_valid_ratio=0.3):
+        """
+        Local NCC using unfold (reference implementation).
+
+        Args:
+            patch_size (int)
+            stride (int)
+            eps (float)
+            min_valid_ratio (float): minimum fraction of valid pixels in a patch
+        """
+        super().__init__()
+        self.k = patch_size
+        self.stride = stride
+        self.eps = eps
+        self.min_valid = min_valid_ratio * (patch_size ** 2)
+
+    def forward(self, x, y, mask=None):
+        """
+        Args:
+            x, y: (B, C, H, W)
+            mask: (B, 1, H, W) or (B, C, H, W), optional
+
+        Returns:
+            (B,) LNCC per image
+        """
+        assert x.shape == y.shape, "x and y must have same shape"
+        B, C, H, W = x.shape
+        k = self.k
+
+        # ---- Unfold patches ----
+        x_p = F.unfold(x, kernel_size=k, stride=self.stride)  # (B, C*k*k, L)
+        y_p = F.unfold(y, kernel_size=k, stride=self.stride)
+
+        L = x_p.shape[-1]
+
+        # reshape → (B, C, k*k, L)
+        x_p = x_p.view(B, C, k*k, L)
+        y_p = y_p.view(B, C, k*k, L)
+
+        # ---- Handle mask ----
+        if mask is not None:
+            mask = mask.to(x.device).to(x.dtype)
+
+            if mask.shape[1] == 1:
+                mask = mask.expand(-1, C, -1, -1)
+
+            m_p = F.unfold(mask, kernel_size=k, stride=self.stride)
+            m_p = m_p.view(B, C, k*k, L)
+
+            # valid pixel count per patch
+            count = m_p.sum(dim=[2, 3], keepdim=True).clamp(min=1.0)
+
+            # ---- Masked means ----
+            x_mu = (x_p * m_p).sum(dim=[2, 3], keepdim=True) / count
+            y_mu = (y_p * m_p).sum(dim=[2, 3], keepdim=True) / count
+            x_mu2 = x_p.mean(dim=[-1, -2], keepdim=True)
+            # print(f"x_mu: {x_mu}")
+            # print(f"x_mu2: {x_mu2}")
+            # print(f"x mean: {x_mu*count/(k*k*L)}")
+            # print(f"count: {count}")
+
+            # ---- Centered ----
+            x_c = (x_p - x_mu) * m_p
+            y_c = (y_p - y_mu) * m_p
+            # print(f"x_c: {x_c[0, 0, 50:55, :]}")
+            # print(x_c.mean(dim=[2,3]))
+            # print(f"x_c: {x_c[0,0,:,533]}")
+            # print(x_c.sum(dim=[2, 3], keepdim=True))
+
+            # ---- Variance / covariance ----
+            x_var = (x_c ** 2).sum(dim=[2, 3]) / count
+            y_var = (y_c ** 2).sum(dim=[2, 3]) / count
+            
+            x_var2 = x_c.var(dim=[-1, -2], keepdim=True, correction=0) + self.eps
+            # print(f"x_var: {x_var}")
+            # print(f"x_var2: {x_var2}")
+            # print(f"x_var: {x_var*count/(k*k*L)}")
+            # cov_xy = (x_c * y_c).sum(dim=2)
+
+            # # ---- NCC ----
+            # ncc = cov_xy / (torch.sqrt(var_x * var_y + self.eps))
+
+            # # ---- Reject weak patches ----
+            # valid = (count.squeeze(2) > self.min_valid)
+            # ncc = ncc * valid
+
+            # valid_counts = valid.sum(dim=(1, 2)).clamp(min=1)
+            # ncc = ncc.sum(dim=(1, 2)) / valid_counts
+
+
+            # # ---- effective pixel ratio per patch ----
+            # valid = m_p.sum(dim=2, keepdim=True).clamp(min=1.0)
+            # norm_factor = (k * k) / valid  # correction for mean/var bias
+
+            # # ---- apply mask ----
+            # x_p = x_p * m_p
+            # y_p = y_p * m_p
+
+            # # ---- mean (corrected to preserve .mean semantics) ----
+            # x_mu = x_p.mean(dim=2, keepdim=True) * norm_factor
+            # y_mu = y_p.mean(dim=2, keepdim=True) * norm_factor
+
+            # # ---- variance (corrected similarly) ----
+            # x_var = x_p.var(dim=2, keepdim=True, correction=0) * norm_factor
+            # y_var = y_p.var(dim=2, keepdim=True, correction=0) * norm_factor
+
+            # ---- normalize ----
+            x_std = torch.sqrt(x_var + self.eps)
+            y_std = torch.sqrt(y_var + self.eps)
+
+            x_n = x_c / x_std
+            y_n = y_c / y_std
+
+            # ---- correlation (same structure as yours) ----
+            score = torch.einsum("b...,b...->b", x_n, y_n)
+
+            # ---- normalize ----
+            norm = m_p.sum(dim=[1, 2, 3]).clamp(min=1.0)
+            norm = m_p.sum()
+
+            ncc = score / norm
+        else:
+            # ---- Standard LNCC (no mask) ----
+            # mean_x = x_p.mean(dim=2, keepdim=True)
+            # mean_y = y_p.mean(dim=2, keepdim=True)
+
+            # x_c = x_p - mean_x
+            # y_c = y_p - mean_y
+
+            # var_x = (x_c ** 2).sum(dim=2)
+            # var_y = (y_c ** 2).sum(dim=2)
+            # cov_xy = (x_c * y_c).sum(dim=2)
+
+            # ncc = cov_xy / (torch.sqrt(var_x * var_y + self.eps))
+            # ncc = ncc.mean(dim=(1, 2))
+
+            # Normalize x
+            x_mu = x_p.mean(dim=[-1, -2], keepdim=True)
+            x_var = x_p.var(dim=[-1, -2], keepdim=True, correction=0) + self.eps
+            x_std = x_var.sqrt()
+            x_normalized = (x_p - x_mu) / x_std
+
+            # Normalize y
+            y_mu = y_p.mean(dim=[-1, -2], keepdim=True)
+            y_var = y_p.var(dim=[-1, -2], keepdim=True, correction=0) + self.eps
+            y_std = y_var.sqrt()
+            y_normalized = (y_p - y_mu) / y_std
+
+            score = torch.einsum("b...,b...->b", x_normalized, y_normalized)
+            score /= C * H * W * k * k
+            ncc = score
+
+        return ncc
 
 def compute_geodesic_distance(R1, R2):
     """

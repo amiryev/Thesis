@@ -1,5 +1,5 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "1,2,3"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 import argparse
 import json
 import datetime
@@ -141,9 +141,9 @@ class Trainer:
             model_to_access = self.model.module if hasattr(self.model, 'module') else self.model
             # Split parameters into two groups so we can apply different regularisation:
             backbone_params = list(model_to_access.backbone.parameters()) + \
-                            list(model_to_access.sobel.parameters()) + \
-                            list(model_to_access.positional_encoding) +\
-                            list(model_to_access.mask_token)
+                            list(model_to_access.sobel.parameters())
+                            # list(model_to_access.positional_encoding) +\
+                            # list(model_to_access.mask_token)
                             # list(self.model.feature_dropout.parameters()) + \
                             # list(self.model.pooling.parameters())
                             
@@ -513,8 +513,8 @@ class Trainer:
         loss_meter       = AverageMeter()
         rot_loss_meter   = AverageMeter()
         trans_loss_meter = AverageMeter()
-
-        for images, poses_gt, _ in self.val_loader:
+        pbar = tqdm(self.val_loader, desc="Validation Progression", leave=False, disable=not self.is_main)
+        for images, poses_gt, _ in pbar:
             images, poses_gt = images.to(self.device), poses_gt.to(self.device)
             B = images.size(0)
 
@@ -533,6 +533,10 @@ class Trainer:
         Main training loop: iterates over epochs, records metrics, and saves checkpoints.
         """
         self.logger.info("Training sequence started.")
+
+        # Loss values
+        best_trans_loss = torch.inf
+        best_rot_loss = torch.inf
 
         for epoch in range(self.start_epoch, self.args.epochs):
             self.logger.info(f"--- Epoch [ {epoch+1} / {self.args.epochs} ] Started ---")
@@ -591,6 +595,22 @@ class Trainer:
                 self.logger.info(f"*** New best model saved with VAL Loss {self.best_loss:.4f} ***")
                 self.logger.info(f"*************************************************")
 
+            # Save best rotation model
+            if val_rot_loss < best_rot_loss:
+                best_rot_loss = val_rot_loss
+                state["best_loss"] = val_loss
+                self.ckpt_mgr.save("regressor_rot", state)
+                self.logger.info(f"*** New best rotation model saved with VAL Loss {val_rot_loss:.4f} ***")
+                self.logger.info(f"*************************************************")
+            
+            # Save best translation model
+            if val_trans_loss < best_trans_loss:
+                best_trans_loss = val_trans_loss
+                state["best_loss"] = val_loss
+                self.ckpt_mgr.save("regressor_trans", state)
+                self.logger.info(f"*** New best translation model saved with VAL Loss {val_trans_loss:.4f} ***")
+                self.logger.info(f"*************************************************")
+
         self.logger.info("Training sequence completed.")
 
     def load_volume(self, patient_id, rot, trans):
@@ -614,7 +634,7 @@ class Trainer:
         # normalize_and_save
         # subject    = read(volume=str(ct_path), orientation="AP", center_volume=True)
         drr        = DRR(subject, sdd=config.SDD, height=config.IMAGE_SIZE, delx=config.DELX)
-        projection = drr(rot.unsqueeze(0).to("cpu"), trans.unsqueeze(0).to("cpu"), parameterization="euler_angles", convention="ZXY")
+        projection = drr(rot.to("cpu"), trans.to("cpu"), parameterization="euler_angles", convention="ZXY")
         # projection = drr(rot_6d_pred, trans_pred, parameterization="rotation_6d")
 
         out = normalize_and_save(projection, path=None, save=False)
@@ -661,10 +681,10 @@ class Trainer:
         gt_angles   = np.rad2deg(rot_gt)
         info_text   = (
             f"Loss: {loss:.4f}\n"
-            f"GT Rot (deg): [{gt_angles[0]:.1f}, {gt_angles[1]:.1f}, {gt_angles[2]:.1f}] | "
-            f"Trans (mm): [{trans_gt[0]:.1f}, {trans_gt[1]:.1f}, {trans_gt[2]:.1f}]\n"
-            f"PR Rot (deg): [{pred_angles[0]:.1f}, {pred_angles[1]:.1f}, {pred_angles[2]:.1f}] | "
-            f"Trans (mm): [{trans_pred[0]:.1f}, {trans_pred[1]:.1f}, {trans_pred[2]:.1f}]"
+            f"GT Rot (deg): [{gt_angles[0, 0]:.1f}, {gt_angles[0, 1]:.1f}, {gt_angles[0, 2]:.1f}] | "
+            f"Trans (mm): [{trans_gt[0, 0]:.1f}, {trans_gt[0, 1]:.1f}, {trans_gt[0, 2]:.1f}]\n"
+            f"PR Rot (deg): [{pred_angles[0, 0]:.1f}, {pred_angles[0, 1]:.1f}, {pred_angles[0, 2]:.1f}] | "
+            f"Trans (mm): [{trans_pred[0, 0]:.1f}, {trans_pred[0, 1]:.1f}, {trans_pred[0, 2]:.1f}]"
         )
         fig.suptitle(info_text, fontsize=10)
 

@@ -56,7 +56,7 @@ class SobelConv(nn.Module):
             mag_norm = magnitude / (magnitude.amax(dim=(-2,-1), keepdim=True) + eps)
             return torch.cat([x, mag_norm, cos_o, sin_o], dim=1) 
 
-choose = "xrayencoder"
+choose = "basic"
 if choose == "basic":
     class PoseRegressor(nn.Module):
         """
@@ -802,5 +802,164 @@ elif choose == "xrayencoder":
             rot = self.rotation(feats)
             trans = self.translation(feats)
             pose = torch.cat([rot, trans], dim=-1)
+            
+            return rot, trans
+elif choose == "mambaOnly":
+    class MambaVision(nn.Module):
+        def __init__(self, device=config.DEVICE):
+            super().__init__()
+            self.device = device
+            from transformers import AutoModelForImageClassification
+            mambaVision = AutoModelForImageClassification.from_pretrained("nvidia/MambaVision-T-1K", trust_remote_code=True)
+            self.backbone = mambaVision.model.to(self.device)
+        
+        def forward(self, x):
+            _, feat = self.backbone.forward_features(x)
+            return feat[-1]
+
+    class PoseRegressor(nn.Module):
+        """
+        Masked reconstruction autoencoder:
+        input: x (B,1,H,W)   # raw projection in [0,1]
+        masking: patch-wise mask on x (zeros on masked patches)
+        backbone: concat [x_masked, Sobel mag, Sobel orient] -> VGG16.features -> Mamba
+        decoder: upsample to (B,1,H,W)
+        output: recon (B,1,H,W), pixel_mask (B,1,H,W), features
+        """
+        def __init__(self, dropout: int = 0.3, device=config.DEVICE, size: int = config.IMAGE_SIZE, patch_size: int = config.PATCH_SIZE):
+            super().__init__()
+            self.device = device
+            self.size = size
+            self.ps = patch_size
+
+            assert size % patch_size == 0, "size must be divisible by patch_size"
+            self.num_patches_h = size // patch_size
+            self.num_patches_w = size // patch_size
+            self.num_patches = self.num_patches_h * self.num_patches_w
+
+            # Inputs: (x_masked, sobel_mag, sobel_orient) -> 3 channels to match VGG
+            # self.sobel = Sobel()
+            self.sobel = SobelConv()
+
+            # Encoder backbone
+            from transformers import AutoModelForImageClassification
+            self.backbone = MambaVision()
+
+            with torch.no_grad():
+                dummy = torch.zeros(1, 3, config.IMAGE_SIZE, config.IMAGE_SIZE).to(self.device)
+                feat = self.backbone(dummy)
+                B, C, H, W = feat.shape  # skip batch dim 
+
+            # # Mamba over flattened spatial tokens with learned positional encoding
+            # self.positional_encoding = nn.Parameter(torch.zeros(H * W, C))
+            # torch.nn.init.trunc_normal_(self.positional_encoding, std=0.02)
+
+            directions = ["tl_row", "br_col", "tr_row", "bl_col", "br_row", "tl_col", "bl_row", "tr_col"]
+
+            self.mlp = nn.ModuleList(
+                [DirectionalMambaBlock(d_model=C, H=H, W=W, mode=m) for m in directions]
+            )
+
+            self.rotation = nn.Sequential(
+                nn.Conv2d(C, 256, kernel_size=3, stride=1, padding=0),  # (B,256,6,6)
+                nn.ReLU(),
+                nn.Conv2d(256, 128, kernel_size=3, stride=1, padding=0),  # (B,128,4,4)
+                nn.ReLU(),
+                nn.Conv2d(128, 64, kernel_size=3, stride=1, padding=0),   # (B,64,2,2)
+                nn.ReLU(),
+                nn.Conv2d(64, 64, kernel_size=2, stride=1, padding=0),   # (B,64,1,1)
+                nn.ReLU(),
+                nn.Flatten(),                                             # (B,64)
+                nn.Linear(64, 32),
+                nn.ReLU(),
+                nn.Linear(32, 6),
+            )
+
+            self.translation = nn.Sequential(
+                nn.Conv2d(C, 256, kernel_size=3, stride=1, padding=0),  # (B,256,6,6)
+                nn.ReLU(),
+                nn.Conv2d(256, 128, kernel_size=3, stride=1, padding=0),  # (B,128,4,4)
+                nn.ReLU(),
+                nn.Conv2d(128, 64, kernel_size=3, stride=1, padding=0),   # (B,64,2,2)
+                nn.ReLU(),
+                nn.Conv2d(64, 64, kernel_size=2, stride=1, padding=0),   # (B,64,1,1)
+                nn.ReLU(),
+                nn.Flatten(),                                             # (B,64)
+                nn.Linear(64, 32),
+                nn.ReLU(),
+                nn.Linear(32, 3),
+            )
+
+            # self.rotation = nn.Sequential(
+            #     nn.Conv2d(C, 256, kernel_size=3, stride=1, padding=0),  # (B,256,6,6)
+            #     nn.ReLU(),
+            #     nn.Conv2d(256, 128, kernel_size=3, stride=1, padding=0),  # (B,128,4,4)
+            #     nn.ReLU(),
+            #     nn.Conv2d(128, 64, kernel_size=3, stride=1, padding=0),   # (B,64,2,2)
+            #     nn.ReLU(),
+            #     nn.Conv2d(64, 32, kernel_size=2, stride=1, padding=0),   # (B,64,1,1)
+            #     nn.ReLU(),
+            #     nn.Flatten(),                                             # (B,64)
+            #     nn.Linear(32, 16),
+            #     nn.ReLU(),
+            #     nn.Linear(16, 6),
+            # )
+
+            # self.translation = nn.Sequential(
+            #     nn.Conv2d(C, 256, kernel_size=3, stride=1, padding=0),  # (B,256,6,6)
+            #     nn.ReLU(),
+            #     nn.Conv2d(256, 128, kernel_size=3, stride=1, padding=0),  # (B,128,4,4)
+            #     nn.ReLU(),
+            #     nn.Conv2d(128, 64, kernel_size=3, stride=1, padding=0),   # (B,64,2,2)
+            #     nn.ReLU(),
+            #     nn.Conv2d(64, 32, kernel_size=2, stride=1, padding=0),   # (B,64,1,1)
+            #     nn.ReLU(),
+            #     nn.Flatten(),                                             # (B,64)
+            #     nn.Linear(32, 16),
+            #     nn.ReLU(),
+            #     nn.Linear(16, 3),
+            # )            
+
+
+        @torch.no_grad()
+        def load_kernel(self, crm_path, border=3):
+            crm = (io.read_image(crm_path).float().to("cuda") / 255.0).unsqueeze(0)
+            crm = F.interpolate(crm, size=(self.size, self.size), mode='bilinear', align_corners=False)
+            kernel = (crm != 0).float()
+
+            if border > 0:
+                kernel_in = F.max_pool2d(1.0 - kernel.float(), kernel_size=2 * border + 1, stride=1, padding=border,)
+                kernel_valid = (kernel_in == 0)       
+            else:
+                kernel_valid = kernel.bool()      
+
+            return kernel_valid.detach()
+
+        def forward(self, x: torch.Tensor, kernel=1.0):
+            """
+            x: (B,1,H,W)
+            returns: (rotation, translation)
+            """
+            B, C, H, W = x.shape
+            assert C == 1, "Expect (B,1,H,W) grayscale input"
+
+            x = x * kernel
+            # x = TF.resize(x, size=(224,224))
+            x = self.sobel(x)  # (B,1,H,W) each
+            x = self.backbone(x)  # (B,512,4,4)
+
+            B, C, H, W = x.shape
+            tokens = x.view(B, C, H * W).permute(0, 2, 1)  # (B,L,C)
+
+            # tokens = tokens + self.positional_encoding.unsqueeze(0)  # (B,L,C)
+            
+            for block in self.mlp:
+                tokens = block(tokens)
+
+            tokens = tokens.permute(0, 2, 1).view(B, C, H, W)  # (B,L,C)
+
+            rot = self.rotation(tokens)
+            trans = self.translation(tokens)
+            # pose = torch.cat([rot, trans], dim=-1)
             
             return rot, trans

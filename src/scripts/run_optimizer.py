@@ -1,5 +1,5 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 import argparse
 import datetime
 import logging
@@ -8,16 +8,18 @@ from tqdm import tqdm
 
 import torch
 import torch.nn as nn
+import torchvision.io as io
+import torchvision.transforms.functional as TF
 import numpy as np
 import matplotlib.pyplot as plt
 
 from diffdrr.drr import DRR
 from diffdrr.data import read
-from diffdrr.pose import euler_angles_to_matrix, matrix_to_rotation_6d, rotation_6d_to_matrix, matrix_to_euler_angles
+from diffdrr.pose import euler_angles_to_matrix, matrix_to_rotation_6d, rotation_6d_to_matrix, matrix_to_euler_angles, matrix_to_axis_angle
 
 from src.utils import config
 from src.utils.training import setup_logger
-from src.utils.loss import compute_geodesic_distance
+from src.utils.loss import compute_geodesic_distance, LocalNCC
 from src.core.registration import PoseRegressorOptimizer, Optimizer
 from src.core.pose_regressor import PoseRegressor
 
@@ -34,6 +36,7 @@ def parse_args():
     parser.add_argument("--data_dir", type=str, default=Path(config.DATA_DIR), help="Explicit path to CT volume (overrides index)")
     parser.add_argument("--output_dir", type=str, default=None, help="Root directory for outputs")
     parser.add_argument("--ckpt_dir", type=str, default=Path(config.CKPT_DIR), help="Path to PoseRegressor weights")
+    parser.add_argument("--input", type=str, default=None, help="Path to input C-arm image")
     
     # Optimizer settings
     parser.add_argument("--latent_dim", type=int, default=32, help="Latent dimension for PoseGenerator")
@@ -42,8 +45,8 @@ def parse_args():
     parser.add_argument("--patience", type=int, default=25, help="Patience for early stopping during optimization")
     
     # Execution settings
-    parser.add_argument("--num_samples", type=int, default=50, help="Number of random poses/images to evaluate")
-    parser.add_argument("--num_visualize", type=int, default=5, help="Number of samples to visualize and save")
+    parser.add_argument("--num_samples",    type=int,               default=50, help="Number of random poses/images to evaluate")
+    parser.add_argument("--num_visualize",  type=int,               default=5,  help="Number of samples to visualize and save")
     
     return parser.parse_args()
 
@@ -308,18 +311,6 @@ class OptimizerPipeline:
         self.logger.info(f"Mean Optimized Gain: {np.mean(metrics['opt_gain']):.4f}")
         self.logger.info("Execution complete.")
 
-
-if __name__ == "__main__":
-    # Ensure reproducible pseudo-random behavior optionally
-    # torch.manual_seed(42)
-    # np.random.seed(42)
-    
-    args = parse_args()
-    pipeline = OptimizerPipeline(args)
-    pipeline.run()
-
-
-
 class RunFullPipeline:
     """
     Pipeline for testing the PoseRegressor paired with the Latent Pose Optimizer.
@@ -348,7 +339,10 @@ class RunFullPipeline:
         
         # Initialize Optimizer (which holds PoseRegressor internally)
         self.logger.info("Initializing Pose Regressor Optimizer...")
-        self.optimizer = Optimizer(drr=self.ct_path).to(self.device)
+        # self.optimizer = LBFGSOptimizer(ct_path=self.ct_path, scales=1, lr=[0.001]).to(self.device)
+        # self.optimizer = AdamOptimizer(ct_path=self.ct_path, scales=4, lr=[0.001, 0.001]).to(self.device)
+        # self.optimizer = Optimizer(ct_path=self.ct_path, scales=4, lr=[0.001, 0.001]).to(self.device)
+        self.optimizer = Optimizer(ct_path=self.ct_path, loss=LocalNCC(), scales=3, lr=[0.01, 0.01]).to(self.device)
         
         # Load weights for PoseRegressor
         self.pose_regressor = PoseRegressor()
@@ -369,6 +363,7 @@ class RunFullPipeline:
                 self.pose_regressor.load_state_dict(ckpt["model"])
             else:
                 self.pose_regressor.load_state_dict(ckpt)
+            self.pose_regressor.to(self.device)
         else:
             self.logger.warning("No valid PoseRegressor checkpoint provided. Using untrained weights!")
 
@@ -386,9 +381,10 @@ class RunFullPipeline:
         
         # Translations in mm
         # trans_stds = torch.tensor([40.0, 50.0, 40.0], device=self.device)
-        trans_stds = torch.tensor([10.0, 10.0, 20.0], device=self.device)
+        trans_stds = torch.tensor([10.0, 80.0, 20.0], device=self.device)
         translation = torch.randn(3, device=self.device) * trans_stds
-        translation[1] += 650.0  # Base y-offset typically used in the dataset
+        translation[1] += 580.0  # Base y-offset typically used in the dataset
+        # translation[1] += 650.0  # Base y-offset typically used in the dataset
         
         return torch.cat([euler_angles, translation], dim=-1).unsqueeze(0)
 
@@ -446,7 +442,7 @@ class RunFullPipeline:
 
             return loss, loss_rot, loss_trans
 
-    def save_visualization(self, idx, gt_carm, init_proj, opt_proj, init_gain, final_gain):
+    def save_visualization(self, gt_img, init_proj, opt_proj, init_gain, final_gain):
         """
         Saves a visualization showing the ground truth C-arm image alongside the 
         initial prediction projection and the optimized projection.
@@ -454,8 +450,8 @@ class RunFullPipeline:
         cols = 3
         fig, axes = plt.subplots(1, cols, figsize=(15, 5))
         
-        gt_img = gt_carm[0].squeeze().cpu().numpy()
-        init_img = init_proj[0].squeeze().cpu().numpy()
+        gt_img = gt_img[0].squeeze().cpu().numpy()
+        init_img = init_proj[0].squeeze().detach().cpu().numpy()
         opt_img = opt_proj[0].squeeze().cpu().numpy()
         
         images = [gt_img, init_img, opt_img]
@@ -471,7 +467,7 @@ class RunFullPipeline:
             axes[j].axis("off")
 
         plt.tight_layout()
-        plt.savefig(self.output_dir / f"sample_{idx:03d}.png", bbox_inches='tight')
+        plt.savefig(self.output_dir / f"output_image.png", bbox_inches='tight')
         plt.close()
 
     def find_good_pose(self, max_loss = 10.0):
@@ -498,63 +494,78 @@ class RunFullPipeline:
         print(f"GT pose loss was {loss}")
         return gt_pose
 
-    def run(self, input_img):
+    @torch.no_grad()
+    def load_kernel(self, carm_image, border=3):
+        kernel = (carm_image != 0).float()
+
+        if border > 0:
+            kernel_in = nn.functional.max_pool2d(1.0 - kernel.float(), kernel_size=2 * border + 1, stride=1, padding=border)
+            kernel_valid = (kernel_in == 0)       
+        else:
+            kernel_valid = kernel.bool()      
+
+        return kernel_valid.detach()
+
+    def run(self, input_path=None):
         """
         Main execution loop. Generates runtime renders, optimizes poses, and aggregates metrics.
         """
         num_samples = self.args.num_samples
         self.logger.info(f"Starting execution for {num_samples} dynamic samples.")
-        
-        metrics = {
-            "init_rot_err": [], "init_trans_err": [],
-            "opt_rot_err": [], "opt_trans_err": [],
-            "init_gain": [], "opt_gain": []
-        }
-    
+           
         # Estimate initial pose
-        rot_6d_pred, trans_pred = self.pose_regressor(input_img)
+        if input_path is None:
+            # torch.manual_seed(42)
+            gt_pose = self.generate_random_pose()
+            # gt_pose = torch.tensor([0, 0, 0, 0, 500, 0], dtype=torch.float32, device=self.device).unsqueeze(0)
+            print(f"GT pose is: {gt_pose}")
+            input_img = self.optimizer.render_drr(gt_pose)
+            carm_resized = input_img.clone()
+            kernel = 1.0
+        else:
+            gt_pose = torch.zeros(1,6)
+            input_img = io.read_image(input_path).float().to(self.device).unsqueeze(0)
+            input_img = TF.hflip(input_img)
+            input_img = self.optimizer.normalize(input_img, False)
+            # input_img = TF.gaussian_blur(input_img, 7, 0.5)
+            carm_resized = TF.resize(input_img, (config.IMAGE_SIZE, config.IMAGE_SIZE))
+            kernel = self.load_kernel(input_img)
+            io.write_png((kernel.squeeze(0).to(torch.uint8) * 255).cpu(), self.output_dir / "kernel.png")
+            # kernel = 1.0
+            # from src.utils.image_processing import fast_largest_square_crop, largest_valid_square_crop
+            # print(input_img.shape)
+            # input_img = fast_largest_square_crop(input_img.squeeze(0))
+            # print(input_img.shape)
+            # io.write_png((input_img.to(torch.uint8)).cpu(), self.output_dir / "cropped_carm.png")
+            # input_img = input_img.unsqueeze(0)
+
+
+        # Run pose regressor to get initial pose
+        rot_6d_pred, trans_pred = self.pose_regressor(carm_resized)
 
         # Convert to Euler angles
         rot_matrix_pred = rotation_6d_to_matrix(rot_6d_pred)
-        rot_euler_pred = matrix_to_euler_angles(rot_matrix_pred)
+        rot_euler_pred = matrix_to_euler_angles(rot_matrix_pred, convention="ZXY")
         initial_pose = torch.cat([rot_euler_pred, trans_pred], dim=-1)
 
         # Optimize
-        best_pose, best_gain, history = self.optimizer(carm=input_img, initial_pose=initial_pose, iters=self.args.iters, patience=self.args.patience)
+        best_pose, best_gain, history = self.optimizer(carm=input_img, initial_pose=initial_pose, kernel=kernel, iters_per_scale=self.args.iters)
         
-        # 3. Extract Initial Gain
+        # Extract Initial Gain
         init_gain = history['gain'][0]
                 
-        # 5. Log Results
-        self.logger.info(
-            f"Initial -> Gain: {init_gain:.4f} | Rotation: {torch.rad2deg(rot_euler_pred)} deg | Translation: {trans_pred} mm"
-        )
-        self.logger.info(
-            f"Final   -> Gain: {best_gain:.4f} | Rotation: {torch.rad2deg(best_pose[:, :3])} deg | Translation: {best_pose[:, 3:]} mm"
-        )
-        
-        # 7. Visualization
-        if i < self.args.num_visualize:
-            with torch.no_grad():
-                init_proj = self.optimizer.render_drr(init_pose, parameterization="rotation_6d")
-            self.save_visualization(
-                idx=i+1, 
-                gt_carm=carm, 
-                init_proj=init_proj, 
-                opt_proj=best_proj,
-                init_gain=init_gain, 
-                final_gain=final_gain
-            )
-                
-        # # Aggregate statistics and summarize
-        # self.logger.info("=== Aggregated Metrics ===")
-        # self.logger.info(f"Mean Initial Rot Err: {np.mean(metrics['init_rot_err']):.2f} +/- {np.std(metrics['init_rot_err']):.2f} deg")
-        # self.logger.info(f"Mean Optimized Rot Err: {np.mean(metrics['opt_rot_err']):.2f} +/- {np.std(metrics['opt_rot_err']):.2f} deg")
-        # self.logger.info(f"Mean Initial Trans Err: {np.mean(metrics['init_trans_err']):.2f} +/- {np.std(metrics['init_trans_err']):.2f} mm")
-        # self.logger.info(f"Mean Optimized Trans Err: {np.mean(metrics['opt_trans_err']):.2f} +/- {np.std(metrics['opt_trans_err']):.2f} mm")
-        # self.logger.info(f"Mean Initial Gain: {np.mean(metrics['init_gain']):.4f}")
-        # self.logger.info(f"Mean Optimized Gain: {np.mean(metrics['opt_gain']):.4f}")
+        # Log Results
+        self.logger.info(f"Initial -> Gain: {init_gain:.4f} | Rotation: {torch.rad2deg(rot_euler_pred).detach().cpu().squeeze().tolist()} deg | Translation: {trans_pred.detach().cpu().squeeze().tolist()} mm")
+        self.logger.info(f"Final   -> Gain: {best_gain:.4f} | Rotation: {torch.rad2deg(best_pose[:, :3]).detach().cpu().squeeze().tolist()} deg | Translation: {best_pose[:, 3:].detach().cpu().squeeze().tolist()} mm")
+        self.logger.info(f"GT      --------------> Rotation: {torch.rad2deg(gt_pose[:, :3]).detach().cpu().squeeze().tolist()} deg | Translation: {gt_pose[:, 3:].detach().cpu().squeeze().tolist()} mm")
+
+        # Visualization
+        initial_proj = self.optimizer.render_drr(initial_pose, self.drr)
+        optimized_proj = self.optimizer.render_drr(best_pose, self.drr)
+        self.save_visualization(gt_img=input_img, init_proj=initial_proj, opt_proj=optimized_proj, init_gain=init_gain, final_gain=best_gain)
+
         self.logger.info("Execution complete.")
+
 
 
 if __name__ == "__main__":
@@ -563,5 +574,8 @@ if __name__ == "__main__":
     # np.random.seed(42)
     
     args = parse_args()
+    # if args.test_synthetic:
+        # pipeline = TestOptimizer(args)
+    # else:    
     pipeline = RunFullPipeline(args)
-    pipeline.run()
+    pipeline.run(args.input)
