@@ -1,5 +1,5 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "7"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 import argparse
 import datetime
 from pathlib import Path
@@ -45,11 +45,10 @@ def parse_args():
     
     # Execution settings
     parser.add_argument("--num_samples",    type=int,               default=50, help="Number of random poses/images to evaluate")
-    parser.add_argument("--num_visualize",  type=int,               default=5,  help="Number of samples to visualize and save")
-    parser.add_argument("--test_synthetic", action="store_true",                help="Run full pipeline using synthetic CT to validate optimization")
+    parser.add_argument("--num_views",      type=int,               default=2,  help="Number of different views to use")
     parser.add_argument("--exp1",           action="store_true",                help="Run Experiment over all testset patients")
     parser.add_argument("--exp2",           action="store_true",                help="Run Experiment over all testset patients")
-    parser.add_argument("--exp_type",       default='exp_joint',    type=str,   help="Path to input C-arm image")
+    parser.add_argument("--exp_type",       default='exp_multi',    type=str,   help="Path to input C-arm image")
     
     return parser.parse_args()
 
@@ -91,6 +90,7 @@ class PipelineExperiment:
         "init_simlarity", "final_gain", "gain_delta",
         "init_rot_err_deg", "final_rot_err_deg", "rot_improvement_deg",
         "init_trans_err_mm", "final_trans_err_mm", "trans_improvement_mm",
+        "init_depth_err_mm", "final_depth_err_mm", "depth_improvement_mm",
         "converge_iter", "total_iters",
         "run_time_s",
     ]
@@ -123,8 +123,11 @@ class PipelineExperiment:
 
     def create_experiments_registry(self):
         self.registry = {
-            "exp_joint": self.exp1,
+            "exp_multi": self.exp1,
             "exp_sequntial": self.exp_sequntial_optimization,
+            "exp_joint": self.exp_joint_optimization,
+            "exp_joint2": self.exp_joint_many_views_optimization,
+            "exp_real": self._run_single_real_data,
         }
 
     def load_checkpoints(self, id:int=None):
@@ -168,7 +171,7 @@ class PipelineExperiment:
 
         return T
 
-    def compute_metrics(self, gt_pose, pred_pose):
+    def compute_metrics(self, gt_pose, pred_pose, depth=False):
         """
         Computes geodesic rotation error and L2 translation error between ground truth and prediction.
         
@@ -201,8 +204,10 @@ class PipelineExperiment:
         rot_err_deg = torch.rad2deg(rot_dist).item()
         
         trans_err_mm = torch.norm(pred_trans - gt_trans, dim=1).item()
-        
-        return rot_err_deg, trans_err_mm
+
+        depth_err_mm = torch.abs(pred_trans[0, 1] - gt_trans[0, 1]).item()
+
+        return rot_err_deg, trans_err_mm, depth_err_mm
 
     def compute_pde(self, gt_pose, pred_pose, points=None):
         """
@@ -264,7 +269,7 @@ class PipelineExperiment:
         plt.savefig(save_path, bbox_inches='tight')
         plt.close()
 
-    def generate_random_pose(self, N=1, seed=13):
+    def generate_random_pose(self, num_views, N=1, seed=13):
         """
         Generates a valid random GT pose to be used for rendering.
         
@@ -276,22 +281,22 @@ class PipelineExperiment:
 
         # Euler angles (Z,X,Y) in radians
         angle_stds = torch.tensor([0.3, 0.3, 0.3], device=self.device)
-        euler_angles = torch.randn((N, 2, 3), device=self.device) * angle_stds
+        euler_angles = torch.randn((N, num_views, 3), device=self.device) * angle_stds
         
         # Translations in mm
         trans_stds = torch.tensor([20.0, 80.0, 20.0], device=self.device)
-        translation = torch.randn((N, 2, 3), device=self.device) * trans_stds
+        translation = torch.randn((N, num_views, 3), device=self.device) * trans_stds
         translation[..., 1] += 580.0  # Base y-offset typically used in the dataset
         
         gt_poses = torch.cat([euler_angles, translation], dim=-1)
         return gt_poses
 
-    def find_good_pose(self, N=1, max_loss = 10.0):
-        poses_out = torch.zeros((N, 2, 6))
-        for step in range(2):
+    def find_good_pose(self, num_views, N=1, max_loss = 10.0):
+        poses_out = torch.zeros((N, num_views, 6))
+        for step in range(num_views):
             for n in range(N):
                 for i in range(100):
-                    gt_poses = self.generate_random_pose(N=1, seed=np.random.randint(1000))
+                    gt_poses = self.generate_random_pose(num_views=num_views, N=1, seed=np.random.randint(1000))
                     gt_pose = gt_poses[0, 0, :].unsqueeze(0)
                     
                     euler_gt = gt_pose[:, :3]
@@ -316,6 +321,33 @@ class PipelineExperiment:
                 poses_out[n, step, :] = gt_pose
 
         return poses_out
+
+    def load_carm_image(self, input_path):
+        """
+        Loads and preprocesses a C-arm X-ray image for model inference or training.
+
+        Args:
+            input_path (str or Path): Filepath to the raw C-arm input image.
+
+        Returns:
+            torch.Tensor: A 4D preprocessed grayscale image tensor with shape 
+                [1, 1, IMAGE_SIZE, IMAGE_SIZE], cast to float, normalized, 
+                and residing on `self.device`.
+        """
+        # Load as a grayscale tensor and unsqueeze to add a batch dimension: [1, 1, H, W]
+        input_img = io.read_image(input_path, mode=io.ImageReadMode.GRAY).float().to(self.device).unsqueeze(0)
+        
+        # Horizontally flip the image tensor to correct orientation or augment data
+        input_img = TF.hflip(input_img)
+        
+        # Normalize the tensor's intensity distribution using the optimizer's parameters
+        input_img = self.optimizer.normalize(input_img, False)
+        # input_img = TF.gaussian_blur(input_img, 7, 0.5)
+        
+        # Resize to standard model square resolution dimensions defined in config
+        carm_resized = TF.resize(input_img, (config.IMAGE_SIZE, config.IMAGE_SIZE))
+        
+        return carm_resized
 
     # ------------------------------------------------------------------
     # Patient discovery
@@ -409,11 +441,8 @@ class PipelineExperiment:
             if not self._reinit_patient(pat_dir, pat_index):
                 continue                       # CT missing or failed to load
 
-            # self.gt_poses = self.generate_random_pose(
-            #     N    = num_samples, 
-            #     seed = pat_index,
-            # )
-            self.gt_poses = self.find_good_pose(N=num_samples, max_loss=10).to(self.device)
+            # self.gt_poses = self.generate_random_pose(num_views=self.args.num_views, N=num_samples, seed=pat_index)
+            self.gt_poses = self.find_good_pose(num_views=self.args.num_views, N=num_samples, max_loss=10).to(self.device)
             
             
             if exp not in self.registry.keys():
@@ -569,8 +598,144 @@ class PipelineExperiment:
         finally:
             self.output_dir = orig_output_dir
 
+    def _run_single_real_data(self, run_idx: int, run_outdir: Path) -> dict | None:
+        """
+        Execute one multi-view pipeline pass:
+          1. Sample two independent GT poses and render a DRR pair.
+          2. Run the pose regressor on each image independently.
+          3. Compute the relative transform between the two predicted poses.
+          4. Build ViewData objects and call MultiViewOptimizer.forward_multiview().
+          5. Report metrics w.r.t. view-0 (reference view) for backward
+             compatibility with the existing reporting pipeline.
+
+        Saves a visualisation of the reference view to run_outdir.
+        Returns a metrics dict (same structure as _run_single), or None on failure.
+        """
+        orig_output_dir = self.output_dir
+        self.output_dir = run_outdir
+        filename = f"run_{run_idx:03d}"
+        
+        input_dir = Path(self.args.data_dir) / self.output_dir.name
+
+        t0 = time.perf_counter()
+        try:
+            # ── Ground-truth poses & DRRs ─────────────────────────────────
+            gt_pose = torch.tensor([[0.0, 0.0, 0.0, 0.0, 500.0, 0.0]], device=self.device) # AP view
+
+            # Convert GT Euler poses to (R, t)
+            gt_R = euler_angles_to_matrix(gt_pose[:, :3], convention="ZXY")  # (1,3,3)
+            gt_t = gt_pose[:, 3:]                                             # (1,3)
+
+            # Load C-arm images
+            input_path = input_dir / "carm_01.png"
+            img1 = self.load_carm_image(input_path)
+            print(input_path)
+            print(img1.shape)
+            input_path = input_dir / "carm_02.png"
+            img2 = self.load_carm_image(input_path)
+
+            # Save kernel image
+            # kernel = self.load_kernel(input_img)
+            # io.write_png((kernel.squeeze(0).to(torch.uint8) * 255).cpu(), self.output_dir / "kernel.png")
+
+            # ── Pose regressor: initial estimates ─────────────────────────
+            with torch.no_grad():
+                rot_6d_pred1, trans_pred1 = self.pose_regressor(img1)
+                rot_6d_pred2, trans_pred2 = self.pose_regressor(img2)
+
+            # Convert 6D rotation → matrix → Euler (for metrics / ViewData)
+            R1_init = rotation_6d_to_matrix(rot_6d_pred1)   # (1,3,3)
+            t1_init = trans_pred1                            # (1,3)
+            R2_init = rotation_6d_to_matrix(rot_6d_pred2)
+            t2_init = trans_pred2
+
+            # ── Compute initial similarity for the reference view ───────────────
+            with torch.no_grad():
+                init_proj1 = self.optimizer.render_drr(R1_init, t1_init)
+                init_simlarity  = self.optimizer.criterion(init_proj1, img1).item()
+
+            # ── Metrics: initial error w.r.t. reference GT ───────────────
+            # compute_metrics expects (1,6) Euler tensors
+            euler1_init = matrix_to_euler_angles(R1_init, convention="ZXY")
+            initial_pose1 = torch.cat([euler1_init, t1_init], dim=-1)   # (1,6)
+            init_rot_err, init_trans_err, init_depth_err = self.compute_metrics(gt_pose, initial_pose1)
+
+            # ── Relative transform unknown (taken from predicted poses, NOT GT) ─────────
+            R_delta, t_delta = compute_relative_transform(R1_init, t1_init, R2_init, t2_init)
+
+            # ── Build ViewData objects ────────────────────────────────────
+            view1 = ViewData(image = img1, R_init = R1_init, t_init = t1_init, R_delta_1i = torch.eye(3, device=self.device).unsqueeze(0), 
+                             t_delta_1i = torch.zeros(1, 3, device=self.device), weight = 1.0)
+            view2 = ViewData(image = img2, R_init = R2_init, t_init = t2_init, R_delta_1i = R_delta, t_delta_1i = t_delta, weight = 1.0)
+
+            # ── Multi-view joint optimization ─────────────────────────────
+            result = self.optimizer.forward_joint(views = [view1, view2], iters_per_scale = self.args.iters, verbose = False, lambda_cons=0.01)
+
+            # result.R / result.t → optimized reference-view pose
+            best_R = result.R   # (1,3,3)
+            best_t = result.t   # (1,3)
+            
+            # result.per_view_scores[0] is the final NCC similarity for the
+            # reference view — directly comparable to single-view gain.
+            final_gain = result.per_view_scores[0] if result.per_view_scores else torch.inf
+
+            # ── Final metrics (reference view) ────────────────────────────
+            euler_best = matrix_to_euler_angles(best_R, convention="ZXY")
+            best_pose  = torch.cat([euler_best, best_t], dim=-1)   # (1,6)
+            final_rot_err, final_trans_err, final_depth_err = self.compute_metrics(gt_pose, best_pose)
+
+            # ── Convergence ───────────────────────────────────────────────
+            # forward_multiview records loss (lower = better); negate to reuse
+            # _find_convergence_iter which expects gain (higher = better).
+            neg_losses = [-l for l in result.history["total_loss"]]
+            converge_iter, total_iters = self._find_convergence_iter(neg_losses)
+
+            run_time = time.perf_counter() - t0
+
+            # ── Visualisation (reference view only) ───────────────────────
+            optimized_proj = self.optimizer.render_drr(best_R, best_t)
+            self.save_visualization(
+                gt_img     = img1,
+                init_proj  = init_proj1,
+                opt_proj   = optimized_proj,
+                init_simlarity  = init_simlarity,
+                final_gain = final_gain,
+                filename   = filename,
+            )
+
+            return {
+                "run"                  : run_idx,
+                "init_simlarity"       : round(init_simlarity, 5),
+                "final_gain"           : round(final_gain, 5),
+                "gain_delta"           : round(final_gain - init_simlarity, 5),
+                "init_rot_err_deg"     : round(init_rot_err, 4),
+                "final_rot_err_deg"    : round(final_rot_err, 4),
+                "rot_improvement_deg"  : round(init_rot_err - final_rot_err, 4),
+                "init_trans_err_mm"    : round(init_trans_err, 3),
+                "final_trans_err_mm"   : round(final_trans_err, 3),
+                "trans_improvement_mm" : round(init_trans_err - final_trans_err, 3),
+                "init_depth_err_mm"    : round(init_depth_err, 3),
+                "final_depth_err_mm"   : round(final_depth_err, 3),
+                "depth_improvement_mm" : round(init_depth_err - final_depth_err, 3),                
+                "converge_iter"        : converge_iter,
+                "total_iters"          : total_iters,
+                "run_time_s"           : round(run_time, 2),
+                "gt_pose"              : gt_pose.detach().cpu().tolist()[0],
+                "initial_pose"         : initial_pose1.detach().cpu().tolist()[0],
+                "best_pose"            : best_pose.detach().cpu().tolist()[0],
+                "pde_mm"               : self.compute_pde(gt_pose.detach().cpu(), best_pose.detach().cpu()),
+            }
+
+        except Exception as exc:
+            self.logger.error(f"    Run {run_idx} (exp1) failed: {exc}")
+            self.logger.error(traceback.format_exc())
+            return None
+
+        finally:
+            self.output_dir = orig_output_dir
+
     # ------------------------------------------------------------------
-    # Experiment 1: Multi-View Joint Optimization
+    # Experiment 1: Multi-View Optimization
     # ------------------------------------------------------------------
     def exp1(self, run_idx: int, run_outdir: Path) -> dict | None:
         """
@@ -627,10 +792,9 @@ class PipelineExperiment:
             # compute_metrics expects (1,6) Euler tensors
             euler1_init = matrix_to_euler_angles(R1_init, convention="ZXY")
             initial_pose1 = torch.cat([euler1_init, t1_init], dim=-1)   # (1,6)
-            init_rot_err, init_trans_err = self.compute_metrics(gt_pose1, initial_pose1)
+            init_rot_err, init_trans_err, init_depth_err = self.compute_metrics(gt_pose1, initial_pose1)
 
             # ── Relative transform (from predicted poses, NOT GT) ─────────
-            # R_delta, t_delta = compute_relative_transform(R1_init, t1_init, R2_init, t2_init)
             R_delta, t_delta = compute_relative_transform(gt_R1, gt_t1, gt_R2, gt_t2)
 
             # ── Build ViewData objects ────────────────────────────────────
@@ -664,12 +828,12 @@ class PipelineExperiment:
             
             # result.per_view_scores[0] is the final NCC similarity for the
             # reference view — directly comparable to single-view gain.
-            final_gain = result.per_view_scores[0] if result.per_view_scores else -best_loss
+            final_gain = result.per_view_scores[0] if result.per_view_scores else torch.inf
 
             # ── Final metrics (reference view) ────────────────────────────
             euler_best = matrix_to_euler_angles(best_R, convention="ZXY")
             best_pose  = torch.cat([euler_best, best_t], dim=-1)   # (1,6)
-            final_rot_err, final_trans_err = self.compute_metrics(gt_pose1, best_pose)
+            final_rot_err, final_trans_err, final_depth_err = self.compute_metrics(gt_pose1, best_pose)
 
             # ── Convergence ───────────────────────────────────────────────
             # forward_multiview records loss (lower = better); negate to reuse
@@ -692,7 +856,7 @@ class PipelineExperiment:
 
             return {
                 "run"                  : run_idx,
-                "init_simlarity"            : round(init_simlarity, 5),
+                "init_simlarity"       : round(init_simlarity, 5),
                 "final_gain"           : round(final_gain, 5),
                 "gain_delta"           : round(final_gain - init_simlarity, 5),
                 "init_rot_err_deg"     : round(init_rot_err, 4),
@@ -701,6 +865,9 @@ class PipelineExperiment:
                 "init_trans_err_mm"    : round(init_trans_err, 3),
                 "final_trans_err_mm"   : round(final_trans_err, 3),
                 "trans_improvement_mm" : round(init_trans_err - final_trans_err, 3),
+                "init_depth_err_mm"    : round(init_depth_err, 3),
+                "final_depth_err_mm"   : round(final_depth_err, 3),
+                "depth_improvement_mm" : round(init_depth_err - final_depth_err, 3),       
                 "converge_iter"        : converge_iter,
                 "total_iters"          : total_iters,
                 "run_time_s"           : round(run_time, 2),
@@ -779,7 +946,7 @@ class PipelineExperiment:
             # compute_metrics expects (1,6) Euler tensors
             euler1_init = matrix_to_euler_angles(R1_init, convention="ZXY")
             initial_pose1 = torch.cat([euler1_init, t1_init], dim=-1)   # (1,6)
-            init_rot_err, init_trans_err = self.compute_metrics(gt_pose1, initial_pose1)
+            init_rot_err, init_trans_err, init_depth_err = self.compute_metrics(gt_pose1, initial_pose1)
 
             # ── Relative transform (from GT poses) ─────────
             R_delta, t_delta = compute_relative_transform(gt_R1, gt_t1, gt_R2, gt_t2)
@@ -804,12 +971,12 @@ class PipelineExperiment:
             
             # result.per_view_scores[0] is the final NCC similarity for the
             # reference view — directly comparable to single-view gain.
-            final_gain = result.per_view_scores[0] if result.per_view_scores else -best_loss
+            final_gain = result.per_view_scores[0] if result.per_view_scores else torch.inf
 
             # ── Final metrics (reference view) ────────────────────────────
             euler_best = matrix_to_euler_angles(best_R, convention="ZXY")
             best_pose  = torch.cat([euler_best, best_t], dim=-1)   # (1,6)
-            final_rot_err, final_trans_err = self.compute_metrics(gt_pose1, best_pose)
+            final_rot_err, final_trans_err, final_depth_err = self.compute_metrics(gt_pose1, best_pose)
 
             # ── Convergence ───────────────────────────────────────────────
             # forward_multiview records loss (lower = better); negate to reuse
@@ -832,7 +999,7 @@ class PipelineExperiment:
 
             return {
                 "run"                  : run_idx,
-                "init_simlarity"            : round(init_simlarity, 5),
+                "init_simlarity"       : round(init_simlarity, 5),
                 "final_gain"           : round(final_gain, 5),
                 "gain_delta"           : round(final_gain - init_simlarity, 5),
                 "init_rot_err_deg"     : round(init_rot_err, 4),
@@ -841,6 +1008,9 @@ class PipelineExperiment:
                 "init_trans_err_mm"    : round(init_trans_err, 3),
                 "final_trans_err_mm"   : round(final_trans_err, 3),
                 "trans_improvement_mm" : round(init_trans_err - final_trans_err, 3),
+                "init_depth_err_mm"    : round(init_depth_err, 3),
+                "final_depth_err_mm"   : round(final_depth_err, 3),
+                "depth_improvement_mm" : round(init_depth_err - final_depth_err, 3),       
                 "converge_iter"        : converge_iter,
                 "total_iters"          : total_iters,
                 "run_time_s"           : round(run_time, 2),
@@ -858,6 +1028,283 @@ class PipelineExperiment:
         finally:
             self.output_dir = orig_output_dir
 
+    # ------------------------------------------------------------------
+    # Experiment 3: Joint Multi-View Optimization - Relative change in pose is unknown, 2 input views
+    # ------------------------------------------------------------------
+    def exp_joint_optimization(self, run_idx: int, run_outdir: Path) -> dict | None:
+        """
+        Execute one multi-view pipeline pass:
+          1. Sample two independent GT poses and render a DRR pair.
+          2. Run the pose regressor on each image independently.
+          3. Compute the relative transform between the two predicted poses.
+          4. Build ViewData objects and call MultiViewOptimizer.forward_multiview().
+          5. Report metrics w.r.t. view-0 (reference view) for backward
+             compatibility with the existing reporting pipeline.
+
+        Saves a visualisation of the reference view to run_outdir.
+        Returns a metrics dict (same structure as _run_single), or None on failure.
+        """
+        orig_output_dir = self.output_dir
+        self.output_dir = run_outdir
+        filename = f"run_{run_idx:03d}"
+
+        t0 = time.perf_counter()
+        try:
+            # ── Ground-truth poses & DRRs ─────────────────────────────────
+            # self.gt_poses has shape (N, 2, 6); each row is [euler(3), t(3)]
+            gt_pose_pair = self.gt_poses[run_idx]          # (2, 6)
+            gt_pose1     = gt_pose_pair[0].unsqueeze(0)    # (1, 6)  reference
+            gt_pose2     = gt_pose_pair[1].unsqueeze(0)    # (1, 6)  secondary
+
+            # Convert GT Euler poses to (R, t)
+            gt_R1 = euler_angles_to_matrix(gt_pose1[:, :3], convention="ZXY")  # (1,3,3)
+            gt_t1 = gt_pose1[:, 3:]                                             # (1,3)
+            gt_R2 = euler_angles_to_matrix(gt_pose2[:, :3], convention="ZXY")
+            gt_t2 = gt_pose2[:, 3:]
+
+            # Render one DRR per view
+            img1 = self.optimizer.render_drr(gt_R1, gt_t1)   # (1,1,H,W) normalized
+            img2 = self.optimizer.render_drr(gt_R2, gt_t2)
+
+            # ── Pose regressor: initial estimates ─────────────────────────
+            with torch.no_grad():
+                rot_6d_pred1, trans_pred1 = self.pose_regressor(img1)
+                rot_6d_pred2, trans_pred2 = self.pose_regressor(img2)
+
+            # Convert 6D rotation → matrix → Euler (for metrics / ViewData)
+            R1_init = rotation_6d_to_matrix(rot_6d_pred1)   # (1,3,3)
+            t1_init = trans_pred1                            # (1,3)
+            R2_init = rotation_6d_to_matrix(rot_6d_pred2)
+            t2_init = trans_pred2
+
+            # ── Compute initial similarity for the reference view ───────────────
+            with torch.no_grad():
+                init_proj1 = self.optimizer.render_drr(R1_init, t1_init)
+                init_simlarity  = self.optimizer.criterion(init_proj1, img1).item()
+
+            # ── Metrics: initial error w.r.t. reference GT ───────────────
+            # compute_metrics expects (1,6) Euler tensors
+            euler1_init = matrix_to_euler_angles(R1_init, convention="ZXY")
+            initial_pose1 = torch.cat([euler1_init, t1_init], dim=-1)   # (1,6)
+            init_rot_err, init_trans_err, init_depth_err = self.compute_metrics(gt_pose1, initial_pose1)
+
+            # ── Relative transform unknown (taken from predicted poses, NOT GT) ─────────
+            R_delta, t_delta = compute_relative_transform(R1_init, t1_init, R2_init, t2_init)
+
+            # ── Build ViewData objects ────────────────────────────────────
+            view1 = ViewData(image = img1, R_init = R1_init, t_init = t1_init, R_delta_1i = torch.eye(3, device=self.device).unsqueeze(0), 
+                             t_delta_1i = torch.zeros(1, 3, device=self.device), weight = 1.0)
+            view2 = ViewData(image = img2, R_init = R2_init, t_init = t2_init, R_delta_1i = R_delta, t_delta_1i = t_delta, weight = 1.0)
+
+            # ── Multi-view joint optimization ─────────────────────────────
+            result = self.optimizer.forward_joint(views = [view1, view2], iters_per_scale = self.args.iters, verbose = False, lambda_cons=0.01)
+
+            # result.R / result.t → optimized reference-view pose
+            best_R = result.R   # (1,3,3)
+            best_t = result.t   # (1,3)
+            
+            # result.per_view_scores[0] is the final NCC similarity for the
+            # reference view — directly comparable to single-view gain.
+            final_gain = result.per_view_scores[0] if result.per_view_scores else torch.inf
+
+            # ── Final metrics (reference view) ────────────────────────────
+            euler_best = matrix_to_euler_angles(best_R, convention="ZXY")
+            best_pose  = torch.cat([euler_best, best_t], dim=-1)   # (1,6)
+            final_rot_err, final_trans_err, final_depth_err = self.compute_metrics(gt_pose1, best_pose)
+
+            # ── Convergence ───────────────────────────────────────────────
+            # forward_multiview records loss (lower = better); negate to reuse
+            # _find_convergence_iter which expects gain (higher = better).
+            neg_losses = [-l for l in result.history["total_loss"]]
+            converge_iter, total_iters = self._find_convergence_iter(neg_losses)
+
+            run_time = time.perf_counter() - t0
+
+            # ── Visualisation (reference view only) ───────────────────────
+            optimized_proj = self.optimizer.render_drr(best_R, best_t)
+            self.save_visualization(
+                gt_img     = img1,
+                init_proj  = init_proj1,
+                opt_proj   = optimized_proj,
+                init_simlarity  = init_simlarity,
+                final_gain = final_gain,
+                filename   = filename,
+            )
+
+            return {
+                "run"                  : run_idx,
+                "init_simlarity"       : round(init_simlarity, 5),
+                "final_gain"           : round(final_gain, 5),
+                "gain_delta"           : round(final_gain - init_simlarity, 5),
+                "init_rot_err_deg"     : round(init_rot_err, 4),
+                "final_rot_err_deg"    : round(final_rot_err, 4),
+                "rot_improvement_deg"  : round(init_rot_err - final_rot_err, 4),
+                "init_trans_err_mm"    : round(init_trans_err, 3),
+                "final_trans_err_mm"   : round(final_trans_err, 3),
+                "trans_improvement_mm" : round(init_trans_err - final_trans_err, 3),
+                "init_depth_err_mm"    : round(init_depth_err, 3),
+                "final_depth_err_mm"   : round(final_depth_err, 3),
+                "depth_improvement_mm" : round(init_depth_err - final_depth_err, 3),                
+                "converge_iter"        : converge_iter,
+                "total_iters"          : total_iters,
+                "run_time_s"           : round(run_time, 2),
+                "gt_pose"              : gt_pose1.detach().cpu().tolist()[0],
+                "initial_pose"         : initial_pose1.detach().cpu().tolist()[0],
+                "best_pose"            : best_pose.detach().cpu().tolist()[0],
+                "pde_mm"               : self.compute_pde(gt_pose1.detach().cpu(), best_pose.detach().cpu()),
+            }
+
+        except Exception as exc:
+            self.logger.error(f"    Run {run_idx} (exp1) failed: {exc}")
+            self.logger.error(traceback.format_exc())
+            return None
+
+        finally:
+            self.output_dir = orig_output_dir
+
+    # ------------------------------------------------------------------
+    # Experiment 4: Joint Multi-View Optimization - Relative change in pose is unknown, more than 2 views
+    # ------------------------------------------------------------------
+    def exp_joint_many_views_optimization(self, run_idx: int, run_outdir: Path) -> dict | None:
+        """
+        Execute one multi-view pipeline pass:
+          1. Sample two independent GT poses and render a DRR pair.
+          2. Run the pose regressor on each image independently.
+          3. Compute the relative transform between the two predicted poses.
+          4. Build ViewData objects and call MultiViewOptimizer.forward_multiview().
+          5. Report metrics w.r.t. view-0 (reference view) for backward
+             compatibility with the existing reporting pipeline.
+
+        Saves a visualisation of the reference view to run_outdir.
+        Returns a metrics dict (same structure as _run_single), or None on failure.
+        """
+        orig_output_dir = self.output_dir
+        self.output_dir = run_outdir
+        filename = f"run_{run_idx:03d}"
+        num_views = self.args.num_views
+
+        t0 = time.perf_counter()
+        try:
+            # ── Ground-truth poses & DRRs ─────────────────────────────────
+            # self.gt_poses has shape (N, 2, 6); each row is [euler(3), t(3)]
+            gt_poses = self.gt_poses[run_idx]          # (P, 6)
+
+            # Convert GT Euler poses to (R, t)
+            images = []
+            R_init = []
+            t_init = []
+            for p in range(num_views):
+                gt_R = euler_angles_to_matrix(gt_poses[:, p, :3], convention="ZXY")  # (1,3,3)
+                gt_t = gt_poses[:, p, 3:]                                             # (1,3)
+
+                # Render one DRR per view
+                img = self.optimizer.render_drr(gt_R, gt_t) # (1,1,H,W) normalized
+                images.append(img)
+
+                # ── Pose regressor: initial estimates ─────────────────────────
+                with torch.no_grad():
+                    rot_6d_pred, trans_pred = self.pose_regressor(img)
+
+                # Convert 6D rotation → matrix → Euler (for metrics / ViewData)
+                R_init.append(rotation_6d_to_matrix(rot_6d_pred))  # (1,3,3)
+                t_init.append(trans_pred) # (1,3)
+
+            # ── Compute initial similarity for the reference view ───────────────
+            with torch.no_grad():
+                init_proj = self.optimizer.render_drr(R_init[0], t_init[0])
+                init_simlarity  = self.optimizer.criterion(init_proj, img).item()
+            
+            # ── Metrics: initial error w.r.t. reference GT ───────────────
+            # compute_metrics expects (1,6) Euler tensors
+            euler_init = matrix_to_euler_angles(R_init, convention="ZXY")
+            initial_pose = torch.cat([euler_init, t_init], dim=-1)   # (1,6)
+            init_rot_err, init_trans_err, init_depth_err = self.compute_metrics(gt_poses[:, p, :], initial_pose)
+
+            # ── Build ViewData objects ────────────────────────────────────
+            ref_view = ViewData(image = images[0], R_init = R_init[0], t_init = t_init[0], R_delta_1i = torch.eye(3, device=self.device).unsqueeze(0), 
+                            t_delta_1i = torch.zeros(1, 3, device=self.device), weight = 1.0)
+            views = [ref_view]
+
+            for p in range(1, num_views):
+                # ── Metrics: initial error w.r.t. reference GT ───────────────
+                # # compute_metrics expects (1,6) Euler tensors
+                # euler_init1 = matrix_to_euler_angles(R_init[p], convention="ZXY")
+                # initial_pose1 = torch.cat([euler_init1, t_init[p]], dim=-1)   # (1,6)
+                # init_rot_err1, init_trans_err1, init_depth_err1 = self.compute_metrics(gt_poses[:, p, :], initial_pose1)
+
+                # ── Relative transform unknown (taken from predicted poses, NOT GT) ─────────
+                R_delta, t_delta = compute_relative_transform(R_init[0], t_init[0], R_init[p], t_init[p])
+
+                # ── Build ViewData objects ────────────────────────────────────
+                view = ViewData(image = images[p], R_init = R_init[p], t_init = t_init[p], R_delta_1i = R_delta, t_delta_1i = t_delta, weight = 1.0)
+                views.append(view)
+
+            # ── Multi-view joint optimization ─────────────────────────────
+            result = self.optimizer.forward_joint(views = views, iters_per_scale = self.args.iters, verbose = False, lambda_cons=1.0)
+            # result = self.optimizer.forward_joint(views = views, iters_per_scale = self.args.iters, verbose = False)
+
+            # result.R / result.t → optimized reference-view pose
+            best_R = result.R # (1,3,3)
+            best_t = result.t # (1,3)
+            
+            # result.per_view_scores[0] is the final NCC similarity for the
+            # reference view — directly comparable to single-view gain.
+            final_gain = result.per_view_scores[0] if result.per_view_scores else torch.inf
+
+            # ── Final metrics (reference view) ────────────────────────────
+            euler_best = matrix_to_euler_angles(best_R, convention="ZXY")
+            best_pose  = torch.cat([euler_best, best_t], dim=-1)   # (1,6)
+            final_rot_err, final_trans_err, final_depth_err = self.compute_metrics(gt_pose1, best_pose)
+
+            # ── Convergence ───────────────────────────────────────────────
+            # forward_multiview records loss (lower = better); negate to reuse
+            # _find_convergence_iter which expects gain (higher = better).
+            neg_losses = [-l for l in result.history["total_loss"]]
+            converge_iter, total_iters = self._find_convergence_iter(neg_losses)
+
+            run_time = time.perf_counter() - t0
+
+            # ── Visualisation (reference view only) ───────────────────────
+            optimized_proj = self.optimizer.render_drr(best_R, best_t)
+            self.save_visualization(
+                gt_img     = img1,
+                init_proj  = init_proj1,
+                opt_proj   = optimized_proj,
+                init_simlarity  = init_simlarity,
+                final_gain = final_gain,
+                filename   = filename,
+            )
+
+            return {
+                "run"                  : run_idx,
+                "init_simlarity"       : round(init_simlarity, 5),
+                "final_gain"           : round(final_gain, 5),
+                "gain_delta"           : round(final_gain - init_simlarity, 5),
+                "init_rot_err_deg"     : round(init_rot_err, 4),
+                "final_rot_err_deg"    : round(final_rot_err, 4),
+                "rot_improvement_deg"  : round(init_rot_err - final_rot_err, 4),
+                "init_trans_err_mm"    : round(init_trans_err, 3),
+                "final_trans_err_mm"   : round(final_trans_err, 3),
+                "trans_improvement_mm" : round(init_trans_err - final_trans_err, 3),
+                "init_depth_err_mm"    : round(init_depth_err, 3),
+                "final_depth_err_mm"   : round(final_depth_err, 3),
+                "depth_improvement_mm" : round(init_depth_err - final_depth_err, 3),                
+                "converge_iter"        : converge_iter,
+                "total_iters"          : total_iters,
+                "run_time_s"           : round(run_time, 2),
+                "gt_pose"              : gt_pose1.detach().cpu().tolist()[0],
+                "initial_pose"         : initial_pose1.detach().cpu().tolist()[0],
+                "best_pose"            : best_pose.detach().cpu().tolist()[0],
+                "pde_mm"               : self.compute_pde(gt_pose1.detach().cpu(), best_pose.detach().cpu()),
+            }
+
+        except Exception as exc:
+            self.logger.error(f"    Run {run_idx} (exp1) failed: {exc}")
+            self.logger.error(traceback.format_exc())
+            return None
+
+        finally:
+            self.output_dir = orig_output_dir
 
     # ------------------------------------------------------------------
     # Convergence detection
@@ -926,7 +1373,7 @@ class PipelineExperiment:
     # ------------------------------------------------------------------
     # Reporting
     # ------------------------------------------------------------------
-    def _save_patient_report(self, pat_name:    str, pat_outdir:  Path, pat_runs:    list[dict], num_samples: int):
+    def _save_patient_report(self, pat_name: str, pat_outdir:  Path, pat_runs: list[dict], num_samples: int):
         if not pat_runs:
             self.logger.warning(f"  No successful runs for {pat_name}.")
             return
@@ -1065,6 +1512,11 @@ class PipelineExperiment:
             L("  improvement",       S, "trans_improvement_mm", "mm"),
             f"  Runs where trans improved  : {S['pct_trans_improved']}%",
             "",
+            "  DEPTH ERROR",
+            L("  initial",           S, "init_depth_err_mm",    "mm"),
+            L("  final",             S, "final_depth_err_mm",   "mm"),
+            L("  improvement",       S, "depth_improvement_mm", "mm"),
+            "",
             "  SUCCESS RATES",
             *sr_lines,
             "",            
@@ -1166,8 +1618,8 @@ class PipelineExperiment:
 
 if __name__ == "__main__":
     # Ensure reproducible pseudo-random behavior optionally
-    # torch.manual_seed(42)
-    # np.random.seed(42)
+    torch.manual_seed(42)
+    np.random.seed(42)
 
     args = parse_args()
     pipeline = PipelineExperiment(args)
